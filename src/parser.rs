@@ -10,7 +10,7 @@ use crate::gerber_types::{
 };
 use crate::util::{partial_coordinates_from_gerber, partial_coordinates_offset_from_gerber};
 use crate::ParseError;
-use gerber_types::{ApertureBlock, AxisSelect, CommentContent, ComponentCharacteristics, ComponentDrill, ComponentMounting, ComponentOutline, CoordinateMode, CopperType, DrillFunction, DrillRouteType, ExtendedPosition, GenerationSoftware, GerberDate, IPC4761ViaProtection, Ident, ImageMirroring, ImageName, ImageOffset, ImagePolarity, ImageRotation, ImageScaling, Mirroring, Net, NonPlatedDrill, ObjectAttribute, Pin, PlatedDrill, Position, Profile, Rotation, Scaling, StandardComment, ThermalPrimitive, Uuid, VariableDefinition, ZeroOmission};
+use gerber_types::{ApertureBlock, AttributeDeletionCriterion, AxisSelect, CommentContent, ComponentCharacteristics, ComponentDrill, ComponentMounting, ComponentOutline, CoordinateMode, CopperType, DrillFunction, DrillRouteType, ExtendedPosition, GenerationSoftware, GerberDate, IPC4761ViaProtection, Ident, ImageMirroring, ImageName, ImageOffset, ImagePolarity, ImageRotation, ImageScaling, Mirroring, Net, NonPlatedDrill, ObjectAttribute, Pin, PlatedDrill, Position, Profile, Rotation, Scaling, StandardComment, ThermalPrimitive, Uuid, VariableDefinition, ZeroOmission};
 use lazy_regex::*;
 use regex::Regex;
 use std::collections::HashMap;
@@ -63,6 +63,8 @@ static RE_MACRO_VARIABLE: Lazy<Regex> =
 struct ParserContext<T: Read> {
     line_number: usize,
     lines: Lines<BufReader<T>>,
+    aperture_attributes: HashMap<String, ApertureAttribute>,
+    object_attributes: HashMap<String, ObjectAttribute>,
 }
 
 impl<T: Read> ParserContext<T> {
@@ -70,6 +72,8 @@ impl<T: Read> ParserContext<T> {
         ParserContext {
             line_number: 0,
             lines,
+            aperture_attributes: HashMap::new(),
+            object_attributes: HashMap::new(),
         }
     }
 
@@ -226,7 +230,7 @@ fn parse_line<T: Read>(
                         }
                         '4' => {
                             // G04
-                            commands.push(parse_comment(line))
+                            commands.push(parse_comment(line, parser_context))
                         }
                         _ => commands.push(Err(ContentError::UnknownCommand {})),
                     }
@@ -344,15 +348,20 @@ fn parse_line<T: Read>(
                             linechars = trim_attr_line(linechars)?;
 
                             parse_aperture_attribute(linechars.clone())
-                                .map(|attr| ExtendedCode::ApertureAttribute(attr).into())
+                                .map(|(name, attr)| {
+                                    parser_context.aperture_attributes.insert(name, attr.clone());
+                                    ExtendedCode::ApertureAttribute(attr).into()
+                                })
                         }
                         'O' => {
                             linechars = trim_attr_line(linechars)?;
-
                             parse_object_attribute(linechars.clone())
-                                .map(|attr| ExtendedCode::ObjectAttribute(attr).into())
+                                .map(|(name, attr)| {
+                                    parser_context.object_attributes.insert(name, attr.clone());
+                                    ExtendedCode::ObjectAttribute(attr).into()
+                                })
                         }
-                        'D' => parse_delete_attribute(linechars.clone())
+                        'D' => parse_delete_attribute(linechars.clone(), parser_context)
                             .map(ExtendedCode::DeleteAttribute)
                             .map(Command::ExtendedCode),
                         _ => Err(ContentError::UnknownCommand {}),
@@ -697,7 +706,7 @@ fn parse_load_rotation(line: &str) -> Result<Command, ContentError> {
 ///
 /// String: `G04 (String)*`
 /// Standard: `G04 #@! (Attribute)*`
-fn parse_comment(line: &str) -> Result<Command, ContentError> {
+fn parse_comment<T: Read>(line: &str, parser_context: &mut ParserContext<T>) -> Result<Command, ContentError> {
     match RE_COMMENT.captures(line) {
         Some(regmatch) => {
             let string_content = regmatch
@@ -719,10 +728,16 @@ fn parse_comment(line: &str) -> Result<Command, ContentError> {
                             'F' => parse_file_attribute(comment_chars.clone())
                                 .map(StandardComment::FileAttribute),
                             'A' => parse_aperture_attribute(comment_chars.clone())
-                                .map(StandardComment::ApertureAttribute),
+                                .map(|(name, attr)|{
+                                    parser_context.aperture_attributes.insert(name, attr.clone());
+                                    StandardComment::ApertureAttribute(attr)
+                                }),
                             'O' => parse_object_attribute(comment_chars.clone())
-                                .map(StandardComment::ObjectAttribute),
-                            'D' => parse_comment_delete_attribute(comment_chars.clone())
+                                .map(|(name, attr)|{
+                                    parser_context.object_attributes.insert(name, attr.clone());
+                                    StandardComment::ObjectAttribute(attr)
+                                }),
+                            'D' => parse_comment_delete_attribute(comment_chars.clone(), parser_context)
                                 .map(StandardComment::DeleteAttribute),
                             _ => Err(ContentError::UnknownCommand {}),
                         },
@@ -1981,7 +1996,7 @@ fn split_first_str<'a>(slice: &'a [&'a str]) -> (&'a str, &'a [&'a str], usize) 
 /// Parse an Aperture Attribute (%TA.<AttributeName>[,<AttributeValue>]*%) into Command
 ///
 /// ⚠️ This parsing statement needs a lot of tests and validation!
-fn parse_aperture_attribute(line: Chars) -> Result<ApertureAttribute, ContentError> {
+fn parse_aperture_attribute(partial_line: Chars) -> Result<(String, ApertureAttribute), ContentError> {
     use ContentError::UnsupportedApertureAttribute;
 
     build_enum_map!(IPC_MAP, IPC4761ViaProtection);
@@ -2013,13 +2028,13 @@ fn parse_aperture_attribute(line: Chars) -> Result<ApertureAttribute, ContentErr
             })
     }
 
-    let raw_line = line.as_str().to_string();
-    let attr_args = attr_args(line);
+    let raw_line = partial_line.as_str().to_string();
+    let attr_args = attr_args(partial_line);
 
     log::trace!("TA ARGS: {:?}", attr_args);
 
     let (first, remaining_args, remaining_len) = split_first_str(&attr_args);
-    match (first, remaining_args, remaining_len) {
+    let attr = match (first, remaining_args, remaining_len) {
         (".AperFunction", remaining_args, len) if len >= 1 => {
             let (first, remaining_args, remaining_len) = split_first_str(remaining_args);
             Ok(ApertureAttribute::ApertureFunction(
@@ -2123,13 +2138,15 @@ fn parse_aperture_attribute(line: Chars) -> Result<ApertureAttribute, ContentErr
             name: arg.to_string(),
             values: args.iter().map(|v| v.to_string()).collect(),
         }),
-    }
+    };
+
+    attr.map(|it|(first.to_string(), it))
 }
 
 /// Parse an Object Attribute (%TO.<AttributeName>[,<AttributeValue>]*%) into Command
 ///
 /// ⚠️ This parsing statement needs a lot of tests and validation at the current stage!
-fn parse_object_attribute(line: Chars) -> Result<ObjectAttribute, ContentError> {
+fn parse_object_attribute(partial_line: Chars) -> Result<(String, ObjectAttribute), ContentError> {
     macro_rules! parse_cc_decimal {
         ($cc:ident, $value:expr) => {{
             let decimal = $value
@@ -2148,13 +2165,13 @@ fn parse_object_attribute(line: Chars) -> Result<ObjectAttribute, ContentError> 
         }};
     }
 
-    let attr_args = attr_args(line);
+    let attr_args = attr_args(partial_line);
 
     log::trace!("TO ARGS: {:?}", attr_args);
 
     let (first, remaining_args, remaining_len) = split_first_str(&attr_args);
 
-    match (first, remaining_args, remaining_len) {
+    let attr = match (first, remaining_args, remaining_len) {
         (".N", args, len) if len >= 1 => {
             // See 2024.05 - 5.6.13 ".N (Net)" "
             let first = args.first().unwrap();
@@ -2215,20 +2232,37 @@ fn parse_object_attribute(line: Chars) -> Result<ObjectAttribute, ContentError> 
             name: arg.to_string(),
             values: args.iter().map(|v| v.to_string()).collect(),
         }),
-    }
+    };
+
+    attr.map(|it|(first.to_string(), it))
 }
 
-fn parse_delete_attribute(line: Chars) -> Result<String, ContentError> {
+fn parse_delete_attribute<T: Read>(line: Chars, parser_context: &mut ParserContext<T>) -> Result<AttributeDeletionCriterion, ContentError> {
     let line = trim_attr_line(line)?;
-    let attr = line.as_str().splitn(2, '.').nth(1).unwrap_or("");
-    Ok(attr.to_string())
+    let value = line.as_str().to_string();
+
+    parse_delete_attribute_inner(parser_context, value)
 }
 
-fn parse_comment_delete_attribute(mut comment: Chars) -> Result<String, ContentError> {
-    if comment.next() != Some('.') {
-        return Ok(String::from(""));
+fn parse_comment_delete_attribute<T: Read>(comment: Chars, parser_context: &mut ParserContext<T>) -> Result<AttributeDeletionCriterion, ContentError> {
+    let value = comment.as_str().trim().to_string();
+    parse_delete_attribute_inner(parser_context, value)
+}
+
+fn parse_delete_attribute_inner<T: Read>(parser_context: &mut ParserContext<T>, value: String) -> Result<AttributeDeletionCriterion, ContentError> {
+    if value.is_empty() {
+        return Ok(AttributeDeletionCriterion::AllApertureAndObjectAttributes)
     }
-    Ok(comment.as_str().to_string())
+    if parser_context.aperture_attributes.contains_key(&value) {
+        parser_context.aperture_attributes.remove(&value);
+        return Ok(AttributeDeletionCriterion::SingleApertureAttribute(value))
+    }
+    if parser_context.object_attributes.contains_key(&value) {
+        parser_context.object_attributes.remove(&value);
+        return Ok(AttributeDeletionCriterion::SingleObjectAttribute(value))
+    }
+
+    Err(ContentError::InvalidDeleteAttribute { delete_attribute: value })
 }
 
 /// Split the line by commas and convert to a vector of strings

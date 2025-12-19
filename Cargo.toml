@@ -28,9 +28,9 @@ edition = "2018"
 env_logger = ["dep:env_logger"]
 
 [dependencies]
-#gerber-types = "0.7.0"
-# currently un-released, using latest gerber_types with updates to support macro expressions
-gerber-types = { git = "https://github.com/nicolube/gerber-types.git", rev = "b8b10f1a5bb1a488505c4998b51a17a4ada923cb"}
+gerber-types = "0.7.0"
+# currently un-released, using latest gerber_types with changes from PR #51
+#gerber-types = { git = "https://github.com/MakerPnP/gerber-types.git", rev = "580e6afd666d2b3a98246a4d6531ae8ca0317de6"}
 #gerber-types = { path = "../gerber-types" }
 
 # errors
