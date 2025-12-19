@@ -1,18 +1,5 @@
 use gerber_parser::{parse, ContentError, GerberParserErrorWithContext};
-use gerber_types::{
-    Aperture, ApertureAttribute, ApertureBlock, ApertureDefinition, ApertureFunction,
-    ApertureMacro, AxisSelect, Circle, CirclePrimitive, Command, CommentContent,
-    ComponentCharacteristics, ComponentDrill, ComponentMounting, ComponentOutline,
-    CoordinateFormat, CoordinateOffset, Coordinates, CopperType, DCode, DrillFunction,
-    DrillRouteType, ExtendedCode, ExtendedPosition, FiducialScope, FileAttribute, FileFunction,
-    FilePolarity, FunctionCode, GCode, GenerationSoftware, GerberDate, GerberError,
-    IPC4761ViaProtection, Ident, ImageMirroring, ImageOffset, ImagePolarity, ImageRotation,
-    ImageScaling, InterpolationMode, MCode, MacroBoolean, MacroContent, MacroDecimal, MacroInteger,
-    Mirroring, Net, NonPlatedDrill, ObjectAttribute, Operation, OutlinePrimitive, Part, Pin,
-    PlatedDrill, Polarity, Polygon, PolygonPrimitive, Position, Profile, QuadrantMode, Rectangular,
-    Rotation, Scaling, SmdPadType, StandardComment, StepAndRepeat, ThermalPrimitive, Unit, Uuid,
-    VariableDefinition, VectorLinePrimitive,
-};
+use gerber_types::{Aperture, ApertureAttribute, ApertureBlock, ApertureDefinition, ApertureFunction, ApertureMacro, AxisSelect, Circle, CirclePrimitive, Command, CommentContent, ComponentCharacteristics, ComponentDrill, ComponentMounting, ComponentOutline, CoordinateFormat, CoordinateMode, CoordinateOffset, Coordinates, CopperType, DCode, DrillFunction, DrillRouteType, ExtendedCode, ExtendedPosition, FiducialScope, FileAttribute, FileFunction, FilePolarity, FunctionCode, GCode, GenerationSoftware, GerberDate, GerberError, IPC4761ViaProtection, Ident, ImageMirroring, ImageOffset, ImagePolarity, ImageRotation, ImageScaling, InterpolationMode, MCode, MacroBoolean, MacroContent, MacroDecimal, MacroInteger, Mirroring, Net, NonPlatedDrill, ObjectAttribute, Operation, OutlinePrimitive, Part, Pin, PlatedDrill, Polarity, Polygon, PolygonPrimitive, Position, Profile, QuadrantMode, Rectangular, Rotation, Scaling, SmdPadType, StandardComment, StepAndRepeat, ThermalPrimitive, Unit, Uuid, VariableDefinition, VectorLinePrimitive, ZeroOmission};
 use std::collections::HashMap;
 use strum::VariantArray;
 mod util;
@@ -103,14 +90,28 @@ fn format_specification() {
     ",
     );
 
+    let reader_fs_3 = gerber_to_reader(
+        "
+    %FSTAX36Y36*%
+    %MOIN*%
+    G04 Actual apertures and draw commands go here*
+    M02*
+    ",
+    );
+
     assert_eq!(
         parse(reader_fs_1).unwrap().format_specification,
-        Some(CoordinateFormat::new(1, 5))
+        Some(CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute,1, 5))
     );
 
     assert_eq!(
         parse(reader_fs_2).unwrap().format_specification,
-        Some(CoordinateFormat::new(3, 6))
+        Some(CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute,3, 6))
+    );
+
+    assert_eq!(
+        parse(reader_fs_3).unwrap().format_specification,
+        Some(CoordinateFormat::new(ZeroOmission::Trailing, CoordinateMode::Absolute,3, 6))
     );
 }
 
@@ -313,7 +314,7 @@ fn D01_interpolation_linear() {
     ",
     );
 
-    let fs = CoordinateFormat::new(2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,2, 3);
 
     // when
     parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
@@ -371,7 +372,7 @@ fn D01_interpolation_circular() {
     ",
     );
 
-    let fs = CoordinateFormat::new(2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute, 2, 3);
 
     // when
     parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
@@ -426,7 +427,7 @@ fn DO2_move_to_command() {
     ",
     );
 
-    let fs = CoordinateFormat::new(2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,2, 3);
     // when
     parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
         cmd,
@@ -475,7 +476,7 @@ fn DO3_flash_command() {
     ",
     );
 
-    let fs = CoordinateFormat::new(2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,2, 3);
     // when
     parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
         cmd,
@@ -507,7 +508,7 @@ fn omitted_coordinate() {
     // given
     logging_init();
 
-    let reader = gerber_to_reader(
+    let reader_leading = gerber_to_reader(
         "
     %FSLAX23Y23*%
     %MOMM*%
@@ -523,10 +524,25 @@ fn omitted_coordinate() {
     ",
     );
 
-    let fs = CoordinateFormat::new(2, 3);
+    let reader_trailing = gerber_to_reader(
+        "
+    %FSTAX23Y23*%
+    %MOMM*%
+    %ADD999C, 0.01*%
+    D999*
+
+    G04 here the last coordinate is (0,0) - by construction*
+    Y-03D03*
+    G04 Now we set X=1234, but the client needs to maintain the last Y coordinate, namely -3000*
+    X001234D03*
+    M02*
+    ",
+    );
+
+    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,2, 3);
 
     // when
-    parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
+    parse_and_filter!(reader_leading, commands, filtered_commands, |cmd| matches!(
         cmd,
         Ok(Command::FunctionCode(FunctionCode::DCode(
             DCode::Operation(Operation::Flash(_))
@@ -548,7 +564,31 @@ fn omitted_coordinate() {
                 ))
             )))
         ]
-    )
+    );
+    parse_and_filter!(reader_trailing, commands, filtered_commands2, |cmd| matches!(
+        cmd,
+        Ok(Command::FunctionCode(FunctionCode::DCode(
+            DCode::Operation(Operation::Flash(_))
+        )))
+    ));
+
+    // Compare the two results nanos
+    for (i, cmd) in filtered_commands.iter().enumerate() {
+        let cmd2 = &filtered_commands2[i];
+        match {
+            (cmd, cmd2)
+        } {
+            (
+                Ok(Command::FunctionCode(FunctionCode::DCode(DCode::Operation(Operation::Flash(Some(c1)))))),
+                Ok(Command::FunctionCode(FunctionCode::DCode(DCode::Operation(Operation::Flash(Some(c2))))))
+            ) => {
+                assert_eq!(c1.x, c2.x);
+                assert_eq!(c1.y, c2.y);
+            },
+            _ => panic!("Unexpected command types"),
+        }
+    }
+
 }
 
 // See gerber spec 2021-02, section 4.5
@@ -2070,7 +2110,7 @@ fn diptrace_Dxx_statements() {
     ));
 
     // then
-    let fs = CoordinateFormat::new(3, 5);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,3, 5);
 
     assert_eq_commands!(
         filtered_commands,
@@ -2304,7 +2344,7 @@ M02*
     ));
 
     // then
-    let fs = CoordinateFormat::new(3, 5);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,3, 5);
 
     assert_eq_commands!(
         filtered_commands,
@@ -2785,6 +2825,8 @@ fn diptrace_rounded_rectangle_pcb_outline() {
 
     // then
     let format = CoordinateFormat {
+        zero_omission: ZeroOmission::Leading,
+        coordinate_mode: CoordinateMode::Absolute,
         integer: 3,
         decimal: 5,
     };
@@ -3669,7 +3711,7 @@ fn malformed_aperture_definition() {
         } if *aperture_code == 10 && aperture_name.eq("P") && content.eq("%ADD10P*%")
     ));
 
-    let (error, errors) = errors.split_first().unwrap();
+    let (error, _) = errors.split_first().unwrap();
     println!("{:#?}", error);
     assert!(matches!(error,
         GerberParserErrorWithContext {

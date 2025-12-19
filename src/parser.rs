@@ -10,14 +10,7 @@ use crate::gerber_types::{
 };
 use crate::util::{partial_coordinates_from_gerber, partial_coordinates_offset_from_gerber};
 use crate::ParseError;
-use gerber_types::{
-    ApertureBlock, AxisSelect, CommentContent, ComponentCharacteristics, ComponentDrill,
-    ComponentMounting, ComponentOutline, CopperType, DrillFunction, DrillRouteType,
-    ExtendedPosition, GenerationSoftware, GerberDate, IPC4761ViaProtection, Ident, ImageMirroring,
-    ImageName, ImageOffset, ImagePolarity, ImageRotation, ImageScaling, Mirroring, Net,
-    NonPlatedDrill, ObjectAttribute, Pin, PlatedDrill, Position, Profile, Rotation, Scaling,
-    StandardComment, ThermalPrimitive, Uuid, VariableDefinition,
-};
+use gerber_types::{ApertureBlock, AttributeDeletionCriterion, AxisSelect, CommentContent, ComponentCharacteristics, ComponentDrill, ComponentMounting, ComponentOutline, CoordinateMode, CopperType, DrillFunction, DrillRouteType, ExtendedPosition, GenerationSoftware, GerberDate, IPC4761ViaProtection, Ident, ImageMirroring, ImageName, ImageOffset, ImagePolarity, ImageRotation, ImageScaling, Mirroring, Net, NonPlatedDrill, ObjectAttribute, Pin, PlatedDrill, Position, Profile, Rotation, Scaling, StandardComment, ThermalPrimitive, Uuid, VariableDefinition, ZeroOmission};
 use lazy_regex::*;
 use regex::Regex;
 use std::collections::HashMap;
@@ -45,7 +38,7 @@ static RE_LOAD_MIRRORING: Lazy<Regex> = lazy_regex!(r"%LM(?P<mirroring>N|X|Y|XY)
 // Note: scaling cannot be negative, or 0.
 static RE_LOAD_SCALING: Lazy<Regex> = lazy_regex!(r"%LS(?P<value>[0-9]+(?:\.[0-9]*)?)\*%");
 static RE_LOAD_ROTATION: Lazy<Regex> = lazy_regex!(r"%LR(?P<value>[+-]?[0-9]+(?:\.[0-9]*)?)\*%");
-static RE_FORMAT_SPEC: Lazy<Regex> = lazy_regex!(r"%FSLAX(.*)Y(.*)\*%");
+static RE_FORMAT_SPEC: Lazy<Regex> = lazy_regex!(r"%FS[LT][AI]X(.*)Y(.*)\*%");
 
 /// https://regex101.com/r/YNnrmK/1
 static RE_APERTURE: Lazy<Regex> =
@@ -70,6 +63,8 @@ static RE_MACRO_VARIABLE: Lazy<Regex> =
 struct ParserContext<T: Read> {
     line_number: usize,
     lines: Lines<BufReader<T>>,
+    aperture_attributes: HashMap<String, ApertureAttribute>,
+    object_attributes: HashMap<String, ObjectAttribute>,
 }
 
 impl<T: Read> ParserContext<T> {
@@ -77,6 +72,8 @@ impl<T: Read> ParserContext<T> {
         ParserContext {
             line_number: 0,
             lines,
+            aperture_attributes: HashMap::new(),
+            object_attributes: HashMap::new(),
         }
     }
 
@@ -233,7 +230,7 @@ fn parse_line<T: Read>(
                         }
                         '4' => {
                             // G04
-                            commands.push(parse_comment(line))
+                            commands.push(parse_comment(line, parser_context))
                         }
                         _ => commands.push(Err(ContentError::UnknownCommand {})),
                     }
@@ -351,15 +348,22 @@ fn parse_line<T: Read>(
                             linechars = trim_attr_line(linechars)?;
 
                             parse_aperture_attribute(linechars.clone())
-                                .map(|attr| ExtendedCode::ApertureAttribute(attr).into())
+                                .map(|(name, attr)| {
+                                    parser_context.aperture_attributes.insert(name, attr.clone());
+                                    ExtendedCode::ApertureAttribute(attr).into()
+                                })
                         }
                         'O' => {
                             linechars = trim_attr_line(linechars)?;
-
                             parse_object_attribute(linechars.clone())
-                                .map(|attr| ExtendedCode::ObjectAttribute(attr).into())
+                                .map(|(name, attr)| {
+                                    parser_context.object_attributes.insert(name, attr.clone());
+                                    ExtendedCode::ObjectAttribute(attr).into()
+                                })
                         }
-                        'D' => parse_delete_attribute(linechars.clone()),
+                        'D' => parse_delete_attribute(linechars.clone(), parser_context)
+                            .map(ExtendedCode::DeleteAttribute)
+                            .map(Command::ExtendedCode),
                         _ => Err(ContentError::UnknownCommand {}),
                     },
                     'S' => match linechars.next().ok_or(ContentError::UnknownCommand {})? {
@@ -702,7 +706,7 @@ fn parse_load_rotation(line: &str) -> Result<Command, ContentError> {
 ///
 /// String: `G04 (String)*`
 /// Standard: `G04 #@! (Attribute)*`
-fn parse_comment(line: &str) -> Result<Command, ContentError> {
+fn parse_comment<T: Read>(line: &str, parser_context: &mut ParserContext<T>) -> Result<Command, ContentError> {
     match RE_COMMENT.captures(line) {
         Some(regmatch) => {
             let string_content = regmatch
@@ -724,9 +728,17 @@ fn parse_comment(line: &str) -> Result<Command, ContentError> {
                             'F' => parse_file_attribute(comment_chars.clone())
                                 .map(StandardComment::FileAttribute),
                             'A' => parse_aperture_attribute(comment_chars.clone())
-                                .map(StandardComment::ApertureAttribute),
+                                .map(|(name, attr)|{
+                                    parser_context.aperture_attributes.insert(name, attr.clone());
+                                    StandardComment::ApertureAttribute(attr)
+                                }),
                             'O' => parse_object_attribute(comment_chars.clone())
-                                .map(StandardComment::ObjectAttribute),
+                                .map(|(name, attr)|{
+                                    parser_context.object_attributes.insert(name, attr.clone());
+                                    StandardComment::ObjectAttribute(attr)
+                                }),
+                            'D' => parse_comment_delete_attribute(comment_chars.clone(), parser_context)
+                                .map(StandardComment::DeleteAttribute),
                             _ => Err(ContentError::UnknownCommand {}),
                         },
                         _ => Err(ContentError::UnknownCommand {}),
@@ -1202,6 +1214,10 @@ fn parse_units(line: &str, gerber_doc: &GerberDoc) -> Result<Unit, ContentError>
 }
 
 /// parse a Gerber format spec statement (e.g. '%FSLAX23Y23*%')
+/// FS<L,T><A|I>X<int><dec>Y<int><dec>*%
+/// <L,T>  = Leading or Trailing (omitted = Leading)
+/// <A|I> = Absolute or Incremental (omitted = Absolute)
+/// <int> = number of integer digits (1-6)
 fn parse_format_spec(line: &str, gerber_doc: &GerberDoc) -> Result<CoordinateFormat, ContentError> {
     // Ensure that FS was not set before, which would imply two FS statements in the same doc
     if gerber_doc.format_specification.is_some() {
@@ -1209,6 +1225,23 @@ fn parse_format_spec(line: &str, gerber_doc: &GerberDoc) -> Result<CoordinateFor
     } else {
         match RE_FORMAT_SPEC.captures(line) {
             Some(regmatch) => {
+                let fs_str = regmatch.get(0)
+                    .ok_or(ContentError::MissingRegexCapture {
+                        regex: RE_FORMAT_SPEC.clone(),
+                        capture_index: 0,
+                    })?
+                    .as_str();
+
+                let zero_omission = match fs_str.chars().nth(3) {
+                    Some('T') => ZeroOmission::Trailing,
+                    _ => ZeroOmission::Leading,
+                };
+
+                let mode = match fs_str.chars().nth(4) {
+                    Some('I') => CoordinateMode::Incremental,
+                    _ => CoordinateMode::Absolute,
+                };
+
                 let mut fs_chars = regmatch
                     .get(1)
                     .ok_or(ContentError::MissingRegexCapture {
@@ -1235,8 +1268,9 @@ fn parse_format_spec(line: &str, gerber_doc: &GerberDoc) -> Result<CoordinateFor
                     });
                 }
 
-                Ok(CoordinateFormat::new(integer, decimal))
+                Ok(CoordinateFormat::new(zero_omission, mode, integer, decimal))
             }
+
             None => Err(ContentError::NoRegexMatch {
                 regex: RE_FORMAT_SPEC.clone(),
             }),
@@ -1492,30 +1526,46 @@ fn parse_command(command_str: &str) -> Result<Command, ContentError> {
     }
 }
 
+
+fn format_coordinate_number(coord: &str, fs: &CoordinateFormat) -> Result<i64, ContentError> {
+    let len = fs.integer + fs.decimal;
+    Ok(match fs.zero_omission {
+        ZeroOmission::Leading => {
+            parse_coord::<i64>(coord)?
+        }
+        ZeroOmission::Trailing => {
+            let len = if coord.starts_with("-") { len + 1 } else { len };
+            let formated = format!("{:0<width$}", coord, width = len as usize);
+            parse_coord::<i64>(formated.as_str())?
+        }
+    })
+}
+
 // parse a Gerber interpolation command (e.g. 'X2000Y40000I300J50000D01*')
 fn parse_interpolation(line: &str, gerber_doc: &GerberDoc) -> Result<Command, ContentError> {
+
     match RE_INTERPOLATION.captures(line) {
         Some(regmatch) => {
-            let x_coord = regmatch
-                .get(1)
-                .map(|x| parse_coord::<i64>(x.as_str()))
-                .transpose()?;
-            let y_coord = regmatch
-                .get(2)
-                .map(|y| parse_coord::<i64>(y.as_str()))
-                .transpose()?;
-            let i_coord = regmatch
-                .get(3)
-                .map(|i| parse_coord::<i64>(i.as_str()))
-                .transpose()?;
-            let j_coord = regmatch
-                .get(4)
-                .map(|i| parse_coord::<i64>(i.as_str()))
-                .transpose()?;
-
             let fs = gerber_doc
                 .format_specification
                 .ok_or(ContentError::OperationBeforeFormat {})?;
+
+            let x_coord = regmatch
+                .get(1)
+                .map(|x| format_coordinate_number(x.as_str(), &fs))
+                .transpose()?;
+            let y_coord = regmatch
+                .get(2)
+                .map(|x| format_coordinate_number(x.as_str(), &fs))
+                .transpose()?;
+            let i_coord = regmatch
+                .get(3)
+                .map(|x| format_coordinate_number(x.as_str(), &fs))
+                .transpose()?;
+            let j_coord = regmatch
+                .get(4)
+                .map(|x| format_coordinate_number(x.as_str(), &fs))
+                .transpose()?;
 
             let coordinates =
                 partial_coordinates_from_gerber(x_coord, y_coord, fs).map_err(|error| {
@@ -1553,18 +1603,18 @@ fn parse_move_or_flash(
 ) -> Result<Command, ContentError> {
     match RE_MOVE_OR_FLASH.captures(line) {
         Some(regmatch) => {
-            let x_coord = regmatch
-                .get(1)
-                .map(|x| parse_coord::<i64>(x.as_str()))
-                .transpose()?;
-            let y_coord = regmatch
-                .get(2)
-                .map(|y| parse_coord::<i64>(y.as_str()))
-                .transpose()?;
-
             let fs = gerber_doc
                 .format_specification
                 .ok_or(ContentError::OperationBeforeFormat {})?;
+
+            let x_coord = regmatch
+                .get(1)
+                .map(|x| format_coordinate_number(x.as_str(), &fs))
+                .transpose()?;
+            let y_coord = regmatch
+                .get(2)
+                .map(|x| format_coordinate_number(x.as_str(), &fs))
+                .transpose()?;
 
             let coords =
                 partial_coordinates_from_gerber(x_coord, y_coord, fs).map_err(|error| {
@@ -1946,7 +1996,7 @@ fn split_first_str<'a>(slice: &'a [&'a str]) -> (&'a str, &'a [&'a str], usize) 
 /// Parse an Aperture Attribute (%TA.<AttributeName>[,<AttributeValue>]*%) into Command
 ///
 /// ⚠️ This parsing statement needs a lot of tests and validation!
-fn parse_aperture_attribute(line: Chars) -> Result<ApertureAttribute, ContentError> {
+fn parse_aperture_attribute(partial_line: Chars) -> Result<(String, ApertureAttribute), ContentError> {
     use ContentError::UnsupportedApertureAttribute;
 
     build_enum_map!(IPC_MAP, IPC4761ViaProtection);
@@ -1978,13 +2028,13 @@ fn parse_aperture_attribute(line: Chars) -> Result<ApertureAttribute, ContentErr
             })
     }
 
-    let raw_line = line.as_str().to_string();
-    let attr_args = attr_args(line);
+    let raw_line = partial_line.as_str().to_string();
+    let attr_args = attr_args(partial_line);
 
     log::trace!("TA ARGS: {:?}", attr_args);
 
     let (first, remaining_args, remaining_len) = split_first_str(&attr_args);
-    match (first, remaining_args, remaining_len) {
+    let attr = match (first, remaining_args, remaining_len) {
         (".AperFunction", remaining_args, len) if len >= 1 => {
             let (first, remaining_args, remaining_len) = split_first_str(remaining_args);
             Ok(ApertureAttribute::ApertureFunction(
@@ -2088,13 +2138,15 @@ fn parse_aperture_attribute(line: Chars) -> Result<ApertureAttribute, ContentErr
             name: arg.to_string(),
             values: args.iter().map(|v| v.to_string()).collect(),
         }),
-    }
+    };
+
+    attr.map(|it|(first.to_string(), it))
 }
 
 /// Parse an Object Attribute (%TO.<AttributeName>[,<AttributeValue>]*%) into Command
 ///
 /// ⚠️ This parsing statement needs a lot of tests and validation at the current stage!
-fn parse_object_attribute(line: Chars) -> Result<ObjectAttribute, ContentError> {
+fn parse_object_attribute(partial_line: Chars) -> Result<(String, ObjectAttribute), ContentError> {
     macro_rules! parse_cc_decimal {
         ($cc:ident, $value:expr) => {{
             let decimal = $value
@@ -2113,13 +2165,13 @@ fn parse_object_attribute(line: Chars) -> Result<ObjectAttribute, ContentError> 
         }};
     }
 
-    let attr_args = attr_args(line);
+    let attr_args = attr_args(partial_line);
 
     log::trace!("TO ARGS: {:?}", attr_args);
 
     let (first, remaining_args, remaining_len) = split_first_str(&attr_args);
 
-    match (first, remaining_args, remaining_len) {
+    let attr = match (first, remaining_args, remaining_len) {
         (".N", args, len) if len >= 1 => {
             // See 2024.05 - 5.6.13 ".N (Net)" "
             let first = args.first().unwrap();
@@ -2180,21 +2232,37 @@ fn parse_object_attribute(line: Chars) -> Result<ObjectAttribute, ContentError> 
             name: arg.to_string(),
             values: args.iter().map(|v| v.to_string()).collect(),
         }),
-    }
+    };
+
+    attr.map(|it|(first.to_string(), it))
 }
 
-fn parse_delete_attribute(line: Chars) -> Result<Command, ContentError> {
-    let raw_line = line.as_str().to_string();
+fn parse_delete_attribute<T: Read>(line: Chars, parser_context: &mut ParserContext<T>) -> Result<AttributeDeletionCriterion, ContentError> {
     let line = trim_attr_line(line)?;
-    let attr_args = attr_args(line);
+    let value = line.as_str().to_string();
 
-    if attr_args.len() == 1 {
-        Ok(ExtendedCode::DeleteAttribute(attr_args[0].to_string()).into())
-    } else {
-        Err(ContentError::InvalidDeleteAttribute {
-            delete_attribute: raw_line,
-        })
+    parse_delete_attribute_inner(parser_context, value)
+}
+
+fn parse_comment_delete_attribute<T: Read>(comment: Chars, parser_context: &mut ParserContext<T>) -> Result<AttributeDeletionCriterion, ContentError> {
+    let value = comment.as_str().trim().to_string();
+    parse_delete_attribute_inner(parser_context, value)
+}
+
+fn parse_delete_attribute_inner<T: Read>(parser_context: &mut ParserContext<T>, value: String) -> Result<AttributeDeletionCriterion, ContentError> {
+    if value.is_empty() {
+        return Ok(AttributeDeletionCriterion::AllApertureAndObjectAttributes)
     }
+    if parser_context.aperture_attributes.contains_key(&value) {
+        parser_context.aperture_attributes.remove(&value);
+        return Ok(AttributeDeletionCriterion::SingleApertureAttribute(value))
+    }
+    if parser_context.object_attributes.contains_key(&value) {
+        parser_context.object_attributes.remove(&value);
+        return Ok(AttributeDeletionCriterion::SingleObjectAttribute(value))
+    }
+
+    Err(ContentError::InvalidDeleteAttribute { delete_attribute: value })
 }
 
 /// Split the line by commas and convert to a vector of strings
@@ -2303,7 +2371,7 @@ fn parse_macro_integer(value: &str) -> Result<MacroInteger, ContentError> {
     }
 }
 
-fn attr_args(partial_line: Chars) -> Vec<&str> {
+fn attr_args(partial_line: Chars<'_>) -> Vec<&str> {
     partial_line
         .as_str()
         .split(',')
@@ -2322,7 +2390,6 @@ fn trim_attr_line(mut partial_line: Chars) -> Result<Chars, ContentError> {
         }),
     }
 }
-
 #[cfg(test)]
 mod attr_args_tests {
     use super::*;
