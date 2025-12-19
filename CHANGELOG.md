@@ -11,6 +11,11 @@ Possible log types:
 - `[fixed]` for any bug fixes.
 - `[security]` to invite users to upgrade in case of vulnerabilities.
 
+### v0.4.0 (2025-12-19)
+
+- [added] Support for all gerber commands supported by gerber-types 0.7.0.
+- [changed] Stricter error handling for TD commands.
+
 ### v0.3.1 (2025-07-25)
 
 - [fixed] Fixed panic when parsing aperture definitions with insufficient arguments.
