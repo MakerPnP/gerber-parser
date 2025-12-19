@@ -1,5 +1,9 @@
 # Releasing
 
+Check CI status:
+
+[![Build status][build-status-badge]][build-status]
+
 Set variables:
 
     $ export VERSION=X.Y.Z
@@ -22,3 +26,8 @@ Publish:
 
     $ cargo publish
     $ git push && git push --tags
+
+<!-- Badges -->
+
+[build-status]: https://github.com/makerpnp/gerber-parser/actions/workflows/ci.yml
+[build-status-badge]: https://github.com/makerpnp/gerber-parser/workflows/CI/badge.svg
