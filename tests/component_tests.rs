@@ -1,5 +1,18 @@
 use gerber_parser::{parse, ContentError, GerberParserErrorWithContext};
-use gerber_types::{Aperture, ApertureAttribute, ApertureBlock, ApertureDefinition, ApertureFunction, ApertureMacro, AxisSelect, Circle, CirclePrimitive, Command, CommentContent, ComponentCharacteristics, ComponentDrill, ComponentMounting, ComponentOutline, CoordinateFormat, CoordinateMode, CoordinateOffset, Coordinates, CopperType, DCode, DrillFunction, DrillRouteType, ExtendedCode, ExtendedPosition, FiducialScope, FileAttribute, FileFunction, FilePolarity, FunctionCode, GCode, GenerationSoftware, GerberDate, GerberError, IPC4761ViaProtection, Ident, ImageMirroring, ImageOffset, ImagePolarity, ImageRotation, ImageScaling, InterpolationMode, MCode, MacroBoolean, MacroContent, MacroDecimal, MacroInteger, Mirroring, Net, NonPlatedDrill, ObjectAttribute, Operation, OutlinePrimitive, Part, Pin, PlatedDrill, Polarity, Polygon, PolygonPrimitive, Position, Profile, QuadrantMode, Rectangular, Rotation, Scaling, SmdPadType, StandardComment, StepAndRepeat, ThermalPrimitive, Unit, Uuid, VariableDefinition, VectorLinePrimitive, ZeroOmission};
+use gerber_types::{
+    Aperture, ApertureAttribute, ApertureBlock, ApertureDefinition, ApertureFunction,
+    ApertureMacro, AxisSelect, Circle, CirclePrimitive, Command, CommentContent,
+    ComponentCharacteristics, ComponentDrill, ComponentMounting, ComponentOutline,
+    CoordinateFormat, CoordinateMode, CoordinateOffset, Coordinates, CopperType, DCode,
+    DrillFunction, DrillRouteType, ExtendedCode, ExtendedPosition, FiducialScope, FileAttribute,
+    FileFunction, FilePolarity, FunctionCode, GCode, GenerationSoftware, GerberDate, GerberError,
+    IPC4761ViaProtection, Ident, ImageMirroring, ImageOffset, ImagePolarity, ImageRotation,
+    ImageScaling, InterpolationMode, MCode, MacroBoolean, MacroContent, MacroDecimal, MacroInteger,
+    Mirroring, Net, NonPlatedDrill, ObjectAttribute, Operation, OutlinePrimitive, Part, Pin,
+    PlatedDrill, Polarity, Polygon, PolygonPrimitive, Position, Profile, QuadrantMode, Rectangular,
+    Rotation, Scaling, SmdPadType, StandardComment, StepAndRepeat, ThermalPrimitive, Unit, Uuid,
+    VariableDefinition, VectorLinePrimitive, ZeroOmission,
+};
 use std::collections::HashMap;
 use strum::VariantArray;
 mod util;
@@ -101,17 +114,32 @@ fn format_specification() {
 
     assert_eq!(
         parse(reader_fs_1).unwrap().format_specification,
-        Some(CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute,1, 5))
+        Some(CoordinateFormat::new(
+            ZeroOmission::Leading,
+            CoordinateMode::Absolute,
+            1,
+            5
+        ))
     );
 
     assert_eq!(
         parse(reader_fs_2).unwrap().format_specification,
-        Some(CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute,3, 6))
+        Some(CoordinateFormat::new(
+            ZeroOmission::Leading,
+            CoordinateMode::Absolute,
+            3,
+            6
+        ))
     );
 
     assert_eq!(
         parse(reader_fs_3).unwrap().format_specification,
-        Some(CoordinateFormat::new(ZeroOmission::Trailing, CoordinateMode::Absolute,3, 6))
+        Some(CoordinateFormat::new(
+            ZeroOmission::Trailing,
+            CoordinateMode::Absolute,
+            3,
+            6
+        ))
     );
 }
 
@@ -314,7 +342,7 @@ fn D01_interpolation_linear() {
     ",
     );
 
-    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 2, 3);
 
     // when
     parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
@@ -372,7 +400,7 @@ fn D01_interpolation_circular() {
     ",
     );
 
-    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute, 2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 2, 3);
 
     // when
     parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
@@ -427,7 +455,7 @@ fn DO2_move_to_command() {
     ",
     );
 
-    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 2, 3);
     // when
     parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
         cmd,
@@ -476,7 +504,7 @@ fn DO3_flash_command() {
     ",
     );
 
-    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 2, 3);
     // when
     parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
         cmd,
@@ -539,7 +567,7 @@ fn omitted_coordinate() {
     ",
     );
 
-    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,2, 3);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 2, 3);
 
     // when
     parse_and_filter!(reader_leading, commands, filtered_commands, |cmd| matches!(
@@ -565,30 +593,36 @@ fn omitted_coordinate() {
             )))
         ]
     );
-    parse_and_filter!(reader_trailing, commands, filtered_commands2, |cmd| matches!(
-        cmd,
-        Ok(Command::FunctionCode(FunctionCode::DCode(
-            DCode::Operation(Operation::Flash(_))
-        )))
-    ));
+    parse_and_filter!(
+        reader_trailing,
+        commands,
+        filtered_commands2,
+        |cmd| matches!(
+            cmd,
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Flash(_))
+            )))
+        )
+    );
 
     // Compare the two results nanos
     for (i, cmd) in filtered_commands.iter().enumerate() {
         let cmd2 = &filtered_commands2[i];
-        match {
-            (cmd, cmd2)
-        } {
+        match { (cmd, cmd2) } {
             (
-                Ok(Command::FunctionCode(FunctionCode::DCode(DCode::Operation(Operation::Flash(Some(c1)))))),
-                Ok(Command::FunctionCode(FunctionCode::DCode(DCode::Operation(Operation::Flash(Some(c2))))))
+                Ok(Command::FunctionCode(FunctionCode::DCode(DCode::Operation(Operation::Flash(
+                    Some(c1),
+                ))))),
+                Ok(Command::FunctionCode(FunctionCode::DCode(DCode::Operation(Operation::Flash(
+                    Some(c2),
+                ))))),
             ) => {
                 assert_eq!(c1.x, c2.x);
                 assert_eq!(c1.y, c2.y);
-            },
+            }
             _ => panic!("Unexpected command types"),
         }
     }
-
 }
 
 // See gerber spec 2021-02, section 4.5
@@ -2110,7 +2144,7 @@ fn diptrace_Dxx_statements() {
     ));
 
     // then
-    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,3, 5);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 3, 5);
 
     assert_eq_commands!(
         filtered_commands,
@@ -2344,7 +2378,7 @@ M02*
     ));
 
     // then
-    let fs = CoordinateFormat::new(ZeroOmission::Leading , CoordinateMode::Absolute,3, 5);
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 3, 5);
 
     assert_eq_commands!(
         filtered_commands,
