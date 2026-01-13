@@ -3559,6 +3559,14 @@ fn G04_comment_attributes() {
         G04 #@! TAExample,value1,value2*
         G04 #@! TFExample,value1,value2*
         G04 #@! TOExample,value1,value2*
+        
+        // Test G04 with space but empty content (spec-compliant empty comment)
+        G04 *
+
+        // Altium-style empty comments (G04* without space/content)
+        // Note: Altium doesn't follow the conventional spacing in section 4.1 
+        // Comment (G04) of the 2024.05 spec
+        G04*
 
         M02*
     "#,
@@ -3620,58 +3628,16 @@ fn G04_comment_attributes() {
                     }
                 ))
             )))),
-        ]
-    );
-    assert!(!filtered_commands.is_empty());
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn G04_comments_altium() {
-    // given
-    logging_init();
-
-    let reader = gerber_to_reader(
-        r#"
-        G04*
-        G04 #@! TF.GenerationSoftware,Altium Limited,Altium Designer,25.8.1 (18)*
-        G04*
-        "#,
-    );
-
-    // when
-    parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
-        cmd,
-        Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
-            _
-        ))))
-    ));
-
-    // then
-    assert_eq_commands!(
-        &filtered_commands,
-        &vec![
-            // Empty G04*
+            // Spec-compliant empty comment with space: G04 *
             Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
                 CommentContent::String(String::new())
             )))),
-            // TF.GenerationSoftware
-            Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
-                CommentContent::Standard(StandardComment::FileAttribute(
-                    FileAttribute::GenerationSoftware(GenerationSoftware::new(
-                        "Altium Limited",
-                        "Altium Designer",
-                        Some("25.8.1 (18)")
-                    ))
-                ))
-            )))),
-            // Empty G04*
+            // Altium-style empty G04* (non-conventional spacing)
             Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
                 CommentContent::String(String::new())
             )))),
         ]
     );
-
     assert!(!filtered_commands.is_empty());
 }
 
