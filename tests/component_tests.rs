@@ -3625,6 +3625,56 @@ fn G04_comment_attributes() {
     assert!(!filtered_commands.is_empty());
 }
 
+#[test]
+#[allow(non_snake_case)]
+fn G04_comments_altium() {
+    // given
+    logging_init();
+
+    let reader = gerber_to_reader(
+        r#"
+        G04*
+        G04 #@! TF.GenerationSoftware,Altium Limited,Altium Designer,25.8.1 (18)*
+        G04*
+        "#,
+    );
+
+    // when
+    parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
+        cmd,
+        Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
+            _
+        ))))
+    ));
+
+    // then
+    assert_eq_commands!(
+        &filtered_commands,
+        &vec![
+            // Empty G04*
+            Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
+                CommentContent::String(String::new())
+            )))),
+            // TF.GenerationSoftware
+            Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
+                CommentContent::Standard(StandardComment::FileAttribute(
+                    FileAttribute::GenerationSoftware(GenerationSoftware::new(
+                        "Altium Limited",
+                        "Altium Designer",
+                        Some("25.8.1 (18)")
+                    ))
+                ))
+            )))),
+            // Empty G04*
+            Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
+                CommentContent::String(String::new())
+            )))),
+        ]
+    );
+
+    assert!(!filtered_commands.is_empty());
+}
+
 /// Regression test to ensure that malformed aperture definitions don't cause a panic.
 #[test]
 fn malformed_aperture_definition() {
