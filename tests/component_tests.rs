@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use strum::VariantArray;
 mod util;
 use gerber_parser::util::{
-    coordinates_from_gerber, gerber_to_reader, partial_coordinates_from_gerber,
+    coordinates_from_gerber, gerber_doc_as_str, gerber_to_reader, partial_coordinates_from_gerber,
     partial_coordinates_offset_from_gerber,
 };
 use util::testing::logging_init;
@@ -2023,6 +2023,84 @@ fn TF_file_attributes() {
 
     // then
     assert_eq!(filtered_commands, expected_commands,)
+}
+
+/// Guards against silent drift between the parser and the gerber-types serializer
+/// for every `FileAttribute` variant. Each TF line is written in the exact form the
+/// serializer produces, so any divergence surfaces as a textual diff.
+#[test]
+#[allow(non_snake_case)]
+fn TF_file_attributes_serialize_roundtrip() {
+    logging_init();
+
+    const GERBER: &str = "%FSLAX23Y23*%
+%MOMM*%
+%TF.Part,Single*%
+%TF.Part,Array*%
+%TF.Part,FabricationPanel*%
+%TF.Part,Coupon*%
+%TF.Part,Other,Value 1*%
+%TF.FileFunction,Copper,L1,Top*%
+%TF.FileFunction,Copper,L2,Inr,Plane*%
+%TF.FileFunction,Copper,L3,Inr,Signal*%
+%TF.FileFunction,Copper,L4,Bot,Mixed*%
+%TF.FileFunction,Copper,L5,Bot,Hatched*%
+%TF.FileFunction,Plated,1,2,PTH*%
+%TF.FileFunction,Plated,1,6,Blind,Drill*%
+%TF.FileFunction,Plated,3,4,Buried,Rout*%
+%TF.FileFunction,NonPlated,1,2,NPTH*%
+%TF.FileFunction,NonPlated,1,6,Blind,Mixed*%
+%TF.FileFunction,NonPlated,3,4,Buried,Drill*%
+%TF.FileFunction,Profile*%
+%TF.FileFunction,Profile,P*%
+%TF.FileFunction,Profile,NP*%
+%TF.FileFunction,Keepout,Top*%
+%TF.FileFunction,Keepout,Bot*%
+%TF.FileFunction,Soldermask,Top*%
+%TF.FileFunction,Soldermask,Bot,1*%
+%TF.FileFunction,Legend,Top*%
+%TF.FileFunction,Legend,Bot,2*%
+%TF.FileFunction,Component,L1,Top*%
+%TF.FileFunction,Paste,Top*%
+%TF.FileFunction,Paste,Bot*%
+%TF.FileFunction,Glue,Top*%
+%TF.FileFunction,Carbonmask,Top*%
+%TF.FileFunction,Goldmask,Top,1*%
+%TF.FileFunction,Heatsinkmask,Bot*%
+%TF.FileFunction,Peelablemask,Top*%
+%TF.FileFunction,Silvermask,Bot,2*%
+%TF.FileFunction,Tinmask,Top*%
+%TF.FileFunction,Depthrout,Top*%
+%TF.FileFunction,Vcut*%
+%TF.FileFunction,Vcut,Top*%
+%TF.FileFunction,Viafill*%
+%TF.FileFunction,Pads,Top*%
+%TF.FileFunction,Other,Value 1*%
+%TF.FileFunction,Drillmap*%
+%TF.FileFunction,FabricationDrawing*%
+%TF.FileFunction,Vcutmap*%
+%TF.FileFunction,AssemblyDrawing,Top*%
+%TF.FileFunction,AssemblyDrawing,Bot*%
+%TF.FileFunction,ArrayDrawing*%
+%TF.FileFunction,OtherDrawing,Value 1*%
+%TF.FilePolarity,Positive*%
+%TF.FilePolarity,Negative*%
+%TF.SameCoordinates*%
+%TF.SameCoordinates,ident*%
+%TF.SameCoordinates,ffffffff-ffff-ffff-ffff-ffffffffffff*%
+%TF.CreationDate,2015-02-23T15:59:51+01:00*%
+%TF.GenerationSoftware,MakerPnP,gerber-types*%
+%TF.GenerationSoftware,MakerPnP,gerber-types,0.4.0*%
+%TF.ProjectId,My PCB,ffffffff-ffff-ffff-ffff-ffffffffffff,2.0*%
+%TF.MD5,6ab9e892830469cdff7e3e346331d404*%
+%TFNonStandardAttribute,Value 1,Value 2*%
+M02*
+";
+
+    let doc = parse(gerber_to_reader(GERBER)).unwrap();
+    let errors = doc.errors();
+    assert!(errors.is_empty(), "parse produced errors: {:?}", errors);
+    assert_eq!(gerber_doc_as_str(&doc), GERBER);
 }
 
 #[test]
