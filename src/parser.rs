@@ -263,6 +263,30 @@ fn parse_line<T: Read>(
                         _ => Err(ContentError::UnknownCommand {}),
                     },
                 ]),
+                '5' => {
+                    // G54 is the deprecated aperture-select prefix (gerber spec 8.1.1).
+                    // The combined `G54Dnn*` form is still emitted by gerbv on save.
+                    match linechars.next().ok_or(ContentError::UnknownCommand {})? {
+                        '4' => {
+                            let select = Ok(FunctionCode::GCode(GCode::SelectAperture).into());
+                            match linechars.next() {
+                                None | Some('*') => Ok(vec![select]),
+                                Some('D') => {
+                                    linechars.next_back();
+                                    Ok(vec![
+                                        select,
+                                        parse_aperture_selection_or_command(
+                                            line,
+                                            linechars.clone(),
+                                        ),
+                                    ])
+                                }
+                                Some(_) => Ok(vec![Err(ContentError::UnknownCommand {})]),
+                            }
+                        }
+                        _ => Ok(vec![Err(ContentError::UnknownCommand {})]),
+                    }
+                }
                 _ => Ok(vec![Err(ContentError::UnknownCommand {})]),
             }
         }
