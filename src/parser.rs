@@ -1817,6 +1817,8 @@ fn parse_file_attribute(line: Chars) -> Result<FileAttribute, ContentError> {
                 ("Soldermask", args, len) if len <= 2 => {
                     with_side_and_optional_index!(SolderMask, args)
                 }
+                // `Keepout` is the serialized name per gerber-types; spec 11.15 (Rev 2017.11) prefers `Profile` now.
+                ("Keepout", args, 1) => with_side!(KeepOut, args),
                 ("Legend", args, len) if len <= 2 => with_side_and_optional_index!(Legend, args),
                 ("Component", args, 2) => with_layer_and_side!(Component, args),
                 ("Paste", args, 1) => with_side!(Paste, args),
