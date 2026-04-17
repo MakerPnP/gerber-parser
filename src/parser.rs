@@ -32,7 +32,7 @@ use std::sync::LazyLock;
 // FUTURE using named captures in all regular expressions would be nice, this would enable the use of string
 //        constants for the capture names, this would improve the error messages too.
 static RE_UNITS: Lazy<Regex> = lazy_regex!(r"%MO(.*)\*%");
-static RE_COMMENT: Lazy<Regex> = lazy_regex!(r"G04 ((#@! (?P<standard>.*))|(?P<string>.*))\*");
+static RE_COMMENT: Lazy<Regex> = lazy_regex!(r"G04( )?((#@! (?P<standard>.*))|(?P<string>.*))\*");
 static RE_AXIS_SELECT: Lazy<Regex> = lazy_regex!(r"%AS(?P<axisselect>AXBY|AYBX)\*%");
 static RE_IMAGE_POLARITY: Lazy<Regex> = lazy_regex!(r"%IP(?P<polarity>POS|NEG)\*%");
 static RE_IMAGE_ROTATION: Lazy<Regex> = lazy_regex!(r"%IR(?P<rotation>0|90|180|270)\*%");

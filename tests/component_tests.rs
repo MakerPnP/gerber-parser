@@ -3637,6 +3637,14 @@ fn G04_comment_attributes() {
         G04 #@! TAExample,value1,value2*
         G04 #@! TFExample,value1,value2*
         G04 #@! TOExample,value1,value2*
+        
+        // Test G04 with space but empty content (spec-compliant empty comment)
+        G04 *
+
+        // Altium-style empty comments (G04* without space/content)
+        // Note: Altium doesn't follow the conventional spacing in section 4.1 
+        // Comment (G04) of the 2024.05 spec
+        G04*
 
         M02*
     "#,
@@ -3697,6 +3705,14 @@ fn G04_comment_attributes() {
                         values: vec!["value1".to_string(), "value2".to_string()],
                     }
                 ))
+            )))),
+            // Spec-compliant empty comment with space: G04 *
+            Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
+                CommentContent::String(String::new())
+            )))),
+            // Altium-style empty G04* (non-conventional spacing)
+            Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
+                CommentContent::String(String::new())
             )))),
         ]
     );
