@@ -319,6 +319,65 @@ fn aperture_selection() {
     )
 }
 
+/// Test deprecated `G54` aperture selection (gerber spec 8.1.1).
+/// Accepts both `G54*` (standalone) and the combined `G54Dnn*` form (emitted by gerbv on save).
+#[test]
+fn deprecated_g54_aperture_selection() {
+    // given
+    logging_init();
+
+    let reader = gerber_to_reader(
+        "
+    %FSLAX23Y23*%
+    %MOMM*%
+
+    %ADD10C, 0.01*%
+    %ADD11R, 0.01X0.15*%
+
+    G04 Deprecated combined G54Dnn form*
+    G54D10*
+    G04 Deprecated standalone G54 form*
+    G54*
+    G04 Deprecated combined G54Dnn form again*
+    G54D11*
+
+    M02*
+    ",
+    );
+
+    // when
+    parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
+        cmd,
+        Ok(Command::FunctionCode(FunctionCode::DCode(
+            DCode::SelectAperture(_)
+        ))) | Ok(Command::FunctionCode(FunctionCode::GCode(
+            GCode::SelectAperture
+        )))
+    ));
+
+    // then
+    assert_eq!(
+        filtered_commands,
+        vec![
+            Ok(Command::FunctionCode(FunctionCode::GCode(
+                GCode::SelectAperture
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::SelectAperture(10)
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::GCode(
+                GCode::SelectAperture
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::GCode(
+                GCode::SelectAperture
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::SelectAperture(11)
+            ))),
+        ]
+    )
+}
+
 /// Test the D01* statements (linear)
 #[test]
 #[allow(non_snake_case)]
