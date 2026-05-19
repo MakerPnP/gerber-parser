@@ -52,8 +52,10 @@ static RE_FORMAT_SPEC: Lazy<Regex> = lazy_regex!(r"%FS[LT][AI]X(.*)Y(.*)\*%");
 static RE_APERTURE: Lazy<Regex> =
     lazy_regex!(r"%ADD([0-9]+)([._$a-zA-Z][._$a-zA-Z0-9]{0,126})(?:,\s?(.*))?\*%");
 static RE_APERTURE_BLOCK: Lazy<Regex> = lazy_regex!(r"%AB(D(?P<code>[0-9]+))?\*%");
+// The `D(0)?1` suffix is optional to support the deprecated modal-D01 form
+// (gerber spec 8.3); the caller has already classified the line as interpolate.
 static RE_INTERPOLATION: Lazy<Regex> =
-    lazy_regex!(r"X?(-?[0-9]+)?Y?(-?[0-9]+)?I?(-?[0-9]+)?J?(-?[0-9]+)?D(0)?1\*");
+    lazy_regex!(r"X?(-?[0-9]+)?Y?(-?[0-9]+)?I?(-?[0-9]+)?J?(-?[0-9]+)?(?:D(0)?1)?\*");
 static RE_MOVE_OR_FLASH: Lazy<Regex> = lazy_regex!(r"X?(-?[0-9]+)?Y?(-?[0-9]+)?D(0)?[2-3]*");
 static RE_IMAGE_NAME: Lazy<Regex> = lazy_regex!(r"%IN(.*)\*%");
 static RE_STEP_REPEAT: Lazy<Regex> =
@@ -68,11 +70,20 @@ static RE_MACRO_DECIMAL: Lazy<Regex> = lazy_regex!(
 static RE_MACRO_VARIABLE: Lazy<Regex> =
     lazy_regex!(r"\$(?P<number>\d+)\s*=\s*(?P<expression>[^*]+)\s*");
 
+// Implicit operation code for the deprecated "Coordinate Data without Operation Code" form
+// (gerber spec 8.3). Set to `Interpolate` by D01; reset to `Undefined` by D02/D03/aperture select.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ModalOperationMode {
+    Undefined,
+    Interpolate,
+}
+
 struct ParserContext<T: Read> {
     line_number: usize,
     lines: Lines<BufReader<T>>,
     aperture_attributes: HashMap<String, ApertureAttribute>,
     object_attributes: HashMap<String, ObjectAttribute>,
+    modal_operation: ModalOperationMode,
 }
 
 impl<T: Read> ParserContext<T> {
@@ -82,6 +93,7 @@ impl<T: Read> ParserContext<T> {
             lines,
             aperture_attributes: HashMap::new(),
             object_attributes: HashMap::new(),
+            modal_operation: ModalOperationMode::Undefined,
         }
     }
 
@@ -97,6 +109,22 @@ impl<T: Read> ParserContext<T> {
                 )
             })
         })
+    }
+
+    // Update the modal operation mode after a command was parsed (gerber spec 8.3).
+    fn update_modal_from_command(&mut self, cmd: &Command) {
+        self.modal_operation = match cmd {
+            Command::FunctionCode(FunctionCode::DCode(DCode::Operation(
+                Operation::Interpolate(..),
+            ))) => ModalOperationMode::Interpolate,
+            Command::FunctionCode(FunctionCode::DCode(DCode::Operation(
+                Operation::Move(..) | Operation::Flash(..),
+            )))
+            | Command::FunctionCode(FunctionCode::DCode(DCode::SelectAperture(_))) => {
+                ModalOperationMode::Undefined
+            }
+            _ => return,
+        };
     }
 }
 
@@ -143,6 +171,7 @@ pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, Par
                 let final_result = match result {
                     Ok(command) => {
                         log::trace!("Parsed command: {:?}", command);
+                        parser_context.update_modal_from_command(&command);
                         Ok(command)
                     }
                     Err(ContentError::IoError(error)) => {
@@ -204,7 +233,7 @@ fn parse_line<T: Read>(
                                 commands.push(parse_interpolate_move_or_flash(
                                     remaining_line,
                                     gerber_doc,
-                                    &mut linechars,
+                                    parser_context.modal_operation,
                                 ));
                             }
                         }
@@ -218,7 +247,7 @@ fn parse_line<T: Read>(
                                 commands.push(parse_interpolate_move_or_flash(
                                     remaining_line,
                                     gerber_doc,
-                                    &mut linechars,
+                                    parser_context.modal_operation,
                                 ));
                             }
                         }
@@ -232,7 +261,7 @@ fn parse_line<T: Read>(
                                 commands.push(parse_interpolate_move_or_flash(
                                     remaining_line,
                                     gerber_doc,
-                                    &mut linechars,
+                                    parser_context.modal_operation,
                                 ));
                             }
                         }
@@ -438,7 +467,7 @@ fn parse_line<T: Read>(
         'X' | 'Y' => Ok(vec![parse_interpolate_move_or_flash(
             line,
             gerber_doc,
-            &mut linechars,
+            parser_context.modal_operation,
         )]),
         'D' => {
             // select aperture D<num>* (where num >= 10) or command where num < 10
@@ -644,17 +673,31 @@ fn parse_axis_select(line: &str) -> Result<Command, ContentError> {
 fn parse_interpolate_move_or_flash(
     line: &str,
     gerber_doc: &mut GerberDoc,
-    linechars: &mut Chars,
+    modal: ModalOperationMode,
 ) -> Result<Command, ContentError> {
-    linechars.next_back();
-    match linechars
-        .next_back()
-        .ok_or(ContentError::UnknownCommand {})?
-    {
-        '1' => parse_interpolation(line, gerber_doc), // D01
-        '2' => parse_move_or_flash(line, gerber_doc, false), // D02
-        '3' => parse_move_or_flash(line, gerber_doc, true), // D03
-        _ => Err(ContentError::UnknownCommand {}),
+    // A trailing `D01`/`D02`/`D03` (or single-digit `D1`/`D2`/`D3`) is an explicit op code.
+    // Coordinates are digits and signs only, so a 'D' preceding the final 1/2/3 is unambiguous.
+    // Absence means the deprecated modal-D01 form (gerber spec 8.3).
+    let bytes = line.strip_suffix('*').unwrap_or(line).as_bytes();
+    let dcode = match bytes.last().copied() {
+        Some(d @ (b'1' | b'2' | b'3')) if bytes.len() >= 2 => {
+            let len = bytes.len();
+            let has_dcode = bytes[len - 2] == b'D'
+                || (len >= 3 && bytes[len - 2] == b'0' && bytes[len - 3] == b'D');
+            has_dcode.then_some(d)
+        }
+        _ => None,
+    };
+
+    match dcode {
+        Some(b'1') => parse_interpolation(line, gerber_doc), // D01
+        Some(b'2') => parse_move_or_flash(line, gerber_doc, false), // D02
+        Some(b'3') => parse_move_or_flash(line, gerber_doc, true), // D03
+        Some(_) => unreachable!(),
+        // Deprecated modal D01 (gerber spec 8.3): `RE_INTERPOLATION` accepts the
+        // suffix-less form, so dispatch straight to it without re-allocating.
+        None if modal == ModalOperationMode::Interpolate => parse_interpolation(line, gerber_doc),
+        None => Err(ContentError::CoordinateDataWithoutOperationCode),
     }
 }
 

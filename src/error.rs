@@ -132,6 +132,8 @@ pub enum ContentError {
     },
     #[error("No end of line found, expected line to end with '*%'. line: '{line}'")]
     NoEndOfLine { line: String },
+    #[error("Coordinate data without an operation code (deprecated modal D01) is only valid after a D01.")]
+    CoordinateDataWithoutOperationCode,
 }
 
 impl ContentError {
