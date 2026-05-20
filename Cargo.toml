@@ -1,6 +1,6 @@
 [package]
 name = "gerber_parser"
-version = "0.4.0"
+version = "0.5.0"
 documentation = "https://docs.rs/gerber-parser"
 repository = "https://github.com/MakerPnP/gerber-parser"
 homepage = "https://github.com/MakerPnP/gerber-parser"

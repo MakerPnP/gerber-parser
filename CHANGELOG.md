@@ -11,6 +11,14 @@ Possible log types:
 - `[fixed]` for any bug fixes.
 - `[security]` to invite users to upgrade in case of vulnerabilities.
 
+### v0.5.0 (2025-12-19)
+
+- [added] Support negative I/J offsets in step-and-repeat.
+- [added] Support deprecated modal D01 (gerber spec 8.3): coordinate-only lines after a D01 implicitly repeat it.
+- [added] Support keepout file function.
+- [added] Support for Altium comments.
+- [added] Support deprecated G54 aperture-select prefix.
+
 ### v0.4.0 (2025-12-19)
 
 - [added] Support for all gerber commands supported by gerber-types 0.7.0.
