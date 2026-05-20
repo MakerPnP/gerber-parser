@@ -437,6 +437,137 @@ fn D01_interpolation_linear() {
     )
 }
 
+/// Test deprecated modal D01 (gerber spec 8.3): coordinate data without an operation code
+/// implicitly repeats the last D01 until any other D-code is encountered.
+#[test]
+fn deprecated_modal_d01_coordinate_data_without_operation_code() {
+    // given
+    logging_init();
+
+    // Example adapted from gerber spec 2021.02 §8.3.
+    let reader = gerber_to_reader(
+        "
+    %FSLAX23Y23*%
+    %MOMM*%
+
+    %ADD10C, 0.01*%
+    %ADD11C, 0.02*%
+
+    D10*
+    X700Y1000D01*
+    G04 Modal D01: coordinate-only line repeats the D01*
+    X1200Y1000*
+    X1200Y1300*
+
+    G04 Modal mode survives across aperture changes once re-armed by another D01*
+    D11*
+    X1700Y2000D01*
+    X2200Y2000*
+    X2200Y2300*
+
+    M02*
+    ",
+    );
+
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 2, 3);
+
+    // when
+    parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
+        cmd,
+        Ok(Command::FunctionCode(FunctionCode::DCode(
+            DCode::Operation(Operation::Interpolate(_, _))
+        )))
+    ));
+
+    // then
+    assert_eq_commands!(
+        filtered_commands,
+        vec![
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(700, 1000, fs).unwrap(),
+                    None,
+                ))
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(1200, 1000, fs).unwrap(),
+                    None,
+                ))
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(1200, 1300, fs).unwrap(),
+                    None,
+                ))
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(1700, 2000, fs).unwrap(),
+                    None,
+                ))
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(2200, 2000, fs).unwrap(),
+                    None,
+                ))
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(2200, 2300, fs).unwrap(),
+                    None,
+                ))
+            ))),
+        ]
+    )
+}
+
+/// A coordinate-only line is invalid when no D01 is in modal effect: after a D02, D03,
+/// or aperture selection (gerber spec 8.3).
+#[test]
+fn deprecated_modal_d01_invalid_without_preceding_d01() {
+    // given
+    logging_init();
+
+    let reader = gerber_to_reader(
+        "
+    %FSLAX23Y23*%
+    %MOMM*%
+
+    %ADD999C, 0.01*%
+
+    G04 Invalid: aperture selection leaves modal mode undefined*
+    D999*
+    X100Y100*
+
+    G04 Invalid: a D02 leaves modal mode undefined*
+    X200Y200D01*
+    X300Y300D02*
+    X400Y400*
+
+    G04 Invalid: a D03 leaves modal mode undefined*
+    X500Y500D01*
+    X600Y600D03*
+    X700Y700*
+
+    M02*
+    ",
+    );
+
+    // when
+    parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
+        cmd,
+        Err(GerberParserErrorWithContext {
+            error: ContentError::CoordinateDataWithoutOperationCode,
+            ..
+        })
+    ));
+
+    // then
+    assert_eq!(filtered_commands.len(), 3)
+}
+
 /// Test the D01* statements (circular)
 #[test]
 #[allow(non_snake_case)]
