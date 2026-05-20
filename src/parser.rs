@@ -57,7 +57,7 @@ static RE_INTERPOLATION: Lazy<Regex> =
 static RE_MOVE_OR_FLASH: Lazy<Regex> = lazy_regex!(r"X?(-?[0-9]+)?Y?(-?[0-9]+)?D(0)?[2-3]*");
 static RE_IMAGE_NAME: Lazy<Regex> = lazy_regex!(r"%IN(.*)\*%");
 static RE_STEP_REPEAT: Lazy<Regex> =
-    lazy_regex!(r"%SRX([0-9]+)Y([0-9]+)I(\d+\.?\d*)J(\d+\.?\d*)\*%");
+    lazy_regex!(r"%SRX([0-9]+)Y([0-9]+)I(-?\d+\.?\d*)J(-?\d+\.?\d*)\*%");
 static RE_MACRO_UNSIGNED_INTEGER: Lazy<Regex> =
     lazy_regex!(r"^(?:(?P<value>[0-9]+)|(?P<variable>\$[0-9]+)|(?P<expression>.*))$");
 static RE_MACRO_BOOLEAN: Lazy<Regex> =

@@ -780,7 +780,7 @@ fn test_load_scaling_zero() {
     ));
 }
 
-/// Test Step and Repeat command (%SR*%)
+/// Test Step and Repeat command (%SR*%), including negative I/J offsets.
 #[test]
 fn step_and_repeat() {
     // given
@@ -800,7 +800,11 @@ fn step_and_repeat() {
     X-1000Y-30000D01*
     %SR*%
 
-    M02*        
+    %SRX12Y6I-3.33J-8.120*%
+    X0Y0D01*
+    %SR*%
+
+    M02*
     ",
     );
 
@@ -820,6 +824,17 @@ fn step_and_repeat() {
                     repeat_y: 6,
                     distance_x: 3.33,
                     distance_y: 8.12,
+                }
+            ))),
+            Ok(Command::ExtendedCode(ExtendedCode::StepAndRepeat(
+                StepAndRepeat::Close
+            ))),
+            Ok(Command::ExtendedCode(ExtendedCode::StepAndRepeat(
+                StepAndRepeat::Open {
+                    repeat_x: 12,
+                    repeat_y: 6,
+                    distance_x: -3.33,
+                    distance_y: -8.12,
                 }
             ))),
             Ok(Command::ExtendedCode(ExtendedCode::StepAndRepeat(
