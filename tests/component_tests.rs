@@ -617,6 +617,22 @@ fn commands_separated_by_block_terminator_on_one_line() {
     )
 }
 
+#[test]
+fn outer_parse_line_errors_are_retained() {
+    let reader = gerber_to_reader(
+        "G04 fixture*%FSLAX23Y23*%%MOMM*%%TF.FileFunction,Copper,L1,Top*%%ADD10C,0.200*%D10*Q*X0Y0D02*X100Y0D01*M02*",
+    );
+
+    let document = parse(reader).unwrap();
+
+    assert_eq!(document.commands.len(), 10);
+    assert_eq!(document.errors().len(), 1);
+    assert!(matches!(
+        document.errors()[0].error,
+        ContentError::UnknownCommand {}
+    ));
+}
+
 /// Test the D01* statements (circular)
 #[test]
 #[allow(non_snake_case)]

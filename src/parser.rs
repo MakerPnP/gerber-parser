@@ -246,8 +246,13 @@ pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, Par
         log::trace!("Line: {}. Content: {:?}", line_number + 1, &line);
 
         if !line.is_empty() {
-            let line_results = parse_line(line, &mut gerber_doc, &mut parser_context);
-            for result in line_results.into_iter().flatten() {
+            // `parse_line` can fail before producing a command. Preserve that outer error in
+            // the document instead of silently dropping the entire framed block.
+            let line_results = match parse_line(line, &mut gerber_doc, &mut parser_context) {
+                Ok(results) => results,
+                Err(error) => vec![Err(error)],
+            };
+            for result in line_results {
                 let final_result = match result {
                     Ok(command) => {
                         log::trace!("Parsed command: {:?}", command);
