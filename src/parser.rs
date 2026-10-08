@@ -22,7 +22,7 @@ use gerber_types::{
 use lazy_regex::*;
 use regex::Regex;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Lines, Read};
+use std::io::{BufReader, Bytes, Read};
 use std::iter::FromIterator;
 use std::str::Chars;
 use std::sync::LazyLock;
@@ -79,36 +79,116 @@ enum ModalOperationMode {
 }
 
 struct ParserContext<T: Read> {
+    // Physical source line on which the most recently returned block started (1-based).
+    // Used only for error context; Gerber itself treats newlines as insignificant.
     line_number: usize,
-    lines: Lines<BufReader<T>>,
+    bytes: Bytes<BufReader<T>>,
+    // Running count of newlines consumed so far.
+    current_line: usize,
     aperture_attributes: HashMap<String, ApertureAttribute>,
     object_attributes: HashMap<String, ObjectAttribute>,
     modal_operation: ModalOperationMode,
 }
 
 impl<T: Read> ParserContext<T> {
-    pub fn new(lines: Lines<BufReader<T>>) -> ParserContext<T> {
+    pub fn new(reader: BufReader<T>) -> ParserContext<T> {
         ParserContext {
             line_number: 0,
-            lines,
+            bytes: reader.bytes(),
+            current_line: 1,
             aperture_attributes: HashMap::new(),
             object_attributes: HashMap::new(),
             modal_operation: ModalOperationMode::Undefined,
         }
     }
 
+    // Yield the next Gerber command block. Commands are delimited by the end-of-block
+    // char `*` (gerber spec 4.1), so a single physical line may hold many commands.
+    // Extended commands `%...%` may contain several `*`-terminated words and span many
+    // lines (e.g. an aperture macro), so the whole `%...%` span is one block. Outside
+    // such a span a newline also ends the block, isolating each physical line so stray
+    // junk errors on its own rather than merging into the next command. Whitespace
+    // inside a block is kept (attribute/comment text may contain spaces) but trimmed.
     pub fn next(&mut self) -> Option<Result<String, ContentError>> {
-        let line = self.lines.next();
-        if line.is_some() {
-            self.line_number += 1;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut in_extended = false;
+        let mut block_line: Option<usize> = None;
+        // Skip whitespace that leads a block (or follows a newline within one).
+        let mut skip_ws = true;
+
+        loop {
+            let byte = match self.bytes.next() {
+                None => break, // EOF
+                Some(Ok(byte)) => byte,
+                Some(Err(e)) => {
+                    return Some(Err(ContentError::IoError(format!(
+                        "IO error on line: {}, error: {}",
+                        self.current_line, e
+                    ))));
+                }
+            };
+
+            if byte == b'\r' {
+                continue; // carriage returns are never significant
+            }
+
+            if byte == b'\n' {
+                self.current_line += 1;
+                // Trim trailing whitespace and skip whatever leads the next line.
+                while buf.last().is_some_and(u8::is_ascii_whitespace) {
+                    buf.pop();
+                }
+                skip_ws = true;
+                // Inside a `%...%` span newlines are insignificant; elsewhere a newline
+                // ends the block, isolating each physical line (junk included).
+                if !in_extended && !buf.is_empty() {
+                    break;
+                }
+                continue;
+            }
+
+            if skip_ws && byte.is_ascii_whitespace() {
+                continue;
+            }
+            skip_ws = false;
+
+            if block_line.is_none() {
+                block_line = Some(self.current_line);
+            }
+
+            match byte {
+                b'%' if in_extended => {
+                    buf.push(byte);
+                    break; // end of extended `%...%` block
+                }
+                b'%' if buf.is_empty() => {
+                    in_extended = true;
+                    buf.push(byte); // start of extended `%...%` block
+                }
+                b'*' if !in_extended => {
+                    buf.push(byte);
+                    break; // end-of-block for a normal command
+                }
+                _ => buf.push(byte),
+            }
         }
-        line.map(|result| {
-            result.map_err(|e| {
-                ContentError::IoError(
-                    format!("IO error on line: {}, error: {}", self.line_number, e).to_string(),
-                )
-            })
-        })
+
+        // Leading whitespace was already skipped; only a block ended by EOF (rather than a
+        // delimiter) can still carry trailing whitespace, so trim that here.
+        while buf.last().is_some_and(u8::is_ascii_whitespace) {
+            buf.pop();
+        }
+        if buf.is_empty() {
+            return None; // nothing left but trailing whitespace / EOF
+        }
+
+        self.line_number = block_line.unwrap_or(self.current_line);
+        Some(String::from_utf8(buf).map_err(|e| {
+            ContentError::IoError(format!(
+                "Invalid UTF-8 on line: {}, error: {}",
+                self.line_number, e
+            ))
+        }))
     }
 
     // Update the modal operation mode after a command was parsed (gerber spec 8.3).
@@ -141,7 +221,7 @@ impl<T: Read> ParserContext<T> {
 pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, ParseError)> {
     let mut gerber_doc = GerberDoc::default();
 
-    let mut parser_context = ParserContext::new(reader.lines());
+    let mut parser_context = ParserContext::new(reader);
 
     let mut parse_error: Option<ParseError> = None;
 
@@ -166,8 +246,13 @@ pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, Par
         log::trace!("Line: {}. Content: {:?}", line_number + 1, &line);
 
         if !line.is_empty() {
-            let line_results = parse_line(line, &mut gerber_doc, &mut parser_context);
-            for result in line_results.into_iter().flatten() {
+            // `parse_line` can fail before producing a command. Preserve that outer error in
+            // the document instead of silently dropping the entire framed block.
+            let line_results = match parse_line(line, &mut gerber_doc, &mut parser_context) {
+                Ok(results) => results,
+                Err(error) => vec![Err(error)],
+            };
+            for result in line_results {
                 let final_result = match result {
                     Ok(command) => {
                         log::trace!("Parsed command: {:?}", command);
@@ -912,6 +997,9 @@ fn parse_aperture_macro_definition<T: Read>(
     log::trace!("macro chunks: {:?}", chunks);
 
     for chunk in chunks {
+        // A block may span several physical lines; the tokenizer drops newlines but
+        // keeps the surrounding indentation, so trim each primitive before matching.
+        let chunk = chunk.trim();
         if let Some(stripped) = chunk.strip_prefix("0 ") {
             // Handle the special-case comment primitive
 
