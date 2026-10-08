@@ -1,5 +1,5 @@
 use crate::document::GerberDoc;
-use crate::error::ContentError;
+use crate::error::{ContentError, ErrorContext};
 use crate::gerber_types::{
     Aperture, ApertureAttribute, ApertureFunction, ApertureMacro, CenterLinePrimitive, Circle,
     CirclePrimitive, Command, CoordinateFormat, DCode, ExtendedCode, FiducialScope, FileAttribute,
@@ -22,7 +22,7 @@ use gerber_types::{
 use lazy_regex::*;
 use regex::Regex;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Lines, Read};
+use std::io::{BufReader, Bytes, Read};
 use std::iter::FromIterator;
 use std::str::Chars;
 use std::sync::LazyLock;
@@ -78,37 +78,128 @@ enum ModalOperationMode {
     Interpolate,
 }
 
+// 1-based source line and column. Gerber treats newlines as insignificant, so this is
+// only carried for error reporting.
+#[derive(Copy, Clone)]
+struct SourcePos {
+    line: usize,
+    offset: usize,
+}
+
 struct ParserContext<T: Read> {
-    line_number: usize,
-    lines: Lines<BufReader<T>>,
+    bytes: Bytes<BufReader<T>>,
+    // Position of the byte stream consumed so far.
+    current: SourcePos,
     aperture_attributes: HashMap<String, ApertureAttribute>,
     object_attributes: HashMap<String, ObjectAttribute>,
     modal_operation: ModalOperationMode,
 }
 
 impl<T: Read> ParserContext<T> {
-    pub fn new(lines: Lines<BufReader<T>>) -> ParserContext<T> {
+    pub fn new(reader: BufReader<T>) -> ParserContext<T> {
         ParserContext {
-            line_number: 0,
-            lines,
+            bytes: reader.bytes(),
+            current: SourcePos { line: 1, offset: 0 },
             aperture_attributes: HashMap::new(),
             object_attributes: HashMap::new(),
             modal_operation: ModalOperationMode::Undefined,
         }
     }
 
-    pub fn next(&mut self) -> Option<Result<String, ContentError>> {
-        let line = self.lines.next();
-        if line.is_some() {
-            self.line_number += 1;
+    // Yield the next Gerber command block together with the position where it starts.
+    // Commands are delimited by the end-of-block char `*` (gerber spec 4.1), so a single
+    // physical line may hold many commands. Extended commands `%...%` may contain several
+    // `*`-terminated words and span many lines (e.g. an aperture macro), so the whole
+    // `%...%` span is one block. Outside such a span a newline also ends the block,
+    // isolating each physical line so stray junk errors on its own rather than merging
+    // into the next command. Whitespace inside a block is kept (attribute/comment text may
+    // contain spaces) but trimmed.
+    pub fn next(&mut self) -> Option<Result<(String, SourcePos), ContentError>> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut in_extended = false;
+        let mut block_start: Option<SourcePos> = None;
+        // Skip whitespace that leads a block (or follows a newline within one).
+        let mut skip_ws = true;
+
+        loop {
+            let byte = match self.bytes.next() {
+                None => break, // EOF
+                Some(Ok(byte)) => byte,
+                Some(Err(e)) => {
+                    return Some(Err(ContentError::IoError(format!(
+                        "IO error on line: {}, error: {}",
+                        self.current.line, e
+                    ))));
+                }
+            };
+            self.current.offset += 1;
+
+            if byte == b'\r' {
+                continue; // carriage returns are never significant
+            }
+
+            if byte == b'\n' {
+                self.current.line += 1;
+                self.current.offset = 0; // next byte is column 1
+                                         // Trim trailing whitespace and skip whatever leads the next line.
+                while buf.last().is_some_and(u8::is_ascii_whitespace) {
+                    buf.pop();
+                }
+                skip_ws = true;
+                // Inside a `%...%` span newlines are insignificant; elsewhere a newline
+                // ends the block, isolating each physical line (junk included).
+                if !in_extended && !buf.is_empty() {
+                    break;
+                }
+                continue;
+            }
+
+            if skip_ws && byte.is_ascii_whitespace() {
+                continue;
+            }
+            skip_ws = false;
+
+            if block_start.is_none() {
+                block_start = Some(self.current);
+            }
+
+            match byte {
+                b'%' if in_extended => {
+                    buf.push(byte);
+                    break; // end of extended `%...%` block
+                }
+                b'%' if buf.is_empty() => {
+                    in_extended = true;
+                    buf.push(byte); // start of extended `%...%` block
+                }
+                b'*' if !in_extended => {
+                    buf.push(byte);
+                    break; // end-of-block for a normal command
+                }
+                _ => buf.push(byte),
+            }
         }
-        line.map(|result| {
-            result.map_err(|e| {
-                ContentError::IoError(
-                    format!("IO error on line: {}, error: {}", self.line_number, e).to_string(),
-                )
-            })
-        })
+
+        // Leading whitespace was already skipped; only a block ended by EOF (rather than a
+        // delimiter) can still carry trailing whitespace, so trim that here.
+        while buf.last().is_some_and(u8::is_ascii_whitespace) {
+            buf.pop();
+        }
+        if buf.is_empty() {
+            return None; // nothing left but trailing whitespace / EOF
+        }
+
+        let position = block_start.unwrap_or(self.current);
+        Some(
+            String::from_utf8(buf)
+                .map(|text| (text, position))
+                .map_err(|e| {
+                    ContentError::IoError(format!(
+                        "Invalid UTF-8 on line: {}, error: {}",
+                        position.line, e
+                    ))
+                }),
+        )
     }
 
     // Update the modal operation mode after a command was parsed (gerber spec 8.3).
@@ -141,7 +232,7 @@ impl<T: Read> ParserContext<T> {
 pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, ParseError)> {
     let mut gerber_doc = GerberDoc::default();
 
-    let mut parser_context = ParserContext::new(reader.lines());
+    let mut parser_context = ParserContext::new(reader);
 
     let mut parse_error: Option<ParseError> = None;
 
@@ -150,10 +241,8 @@ pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, Par
             break;
         };
 
-        let line_number = parser_context.line_number;
-
-        let raw_line = match line_result {
-            Ok(line) => line,
+        let (raw_line, position) = match line_result {
+            Ok(block) => block,
             Err(ContentError::IoError(error)) => {
                 parse_error = Some(ParseError::IoError(error));
                 break;
@@ -162,12 +251,17 @@ pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, Par
         };
         let line = raw_line.trim();
 
-        // Show the line
-        log::trace!("Line: {}. Content: {:?}", line_number + 1, &line);
+        log::trace!("Line: {}. Content: {:?}", position.line, &line);
 
         if !line.is_empty() {
-            let line_results = parse_line(line, &mut gerber_doc, &mut parser_context);
-            for result in line_results.into_iter().flatten() {
+            // `parse_line` may bail with a single outer error before producing any command
+            // (e.g. a truncated command, or an IO error from the macro reader). Funnel that
+            // through the same loop so it gets line context instead of being dropped.
+            let line_results = match parse_line(line, &mut gerber_doc, &mut parser_context) {
+                Ok(results) => results,
+                Err(error) => vec![Err(error)],
+            };
+            for result in line_results {
                 let final_result = match result {
                     Ok(command) => {
                         log::trace!("Parsed command: {:?}", command);
@@ -180,8 +274,12 @@ pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, Par
                         break;
                     }
                     Err(error_without_context) => {
-                        let contexted_error = error_without_context
-                            .to_with_context(Some((line_number, line.to_string())));
+                        let contexted_error =
+                            error_without_context.to_with_context(Some(ErrorContext {
+                                line: position.line,
+                                offset: position.offset,
+                                token: line.to_string(),
+                            }));
                         log::error!("Content error: {}", contexted_error);
                         Err(contexted_error)
                     }
@@ -207,6 +305,32 @@ pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, Par
     }
 }
 
+// Emit the interpolation-mode command, plus the operation it carries when the deprecated
+// combined form is used (e.g. `G01X..Y..D01*` or its single-digit `G1X..Y..D1*` variant,
+// gerber spec 8.3). `remaining_line` is the block after the G-code token.
+fn interpolation_mode_commands(
+    mode: InterpolationMode,
+    remaining_line: &str,
+    gerber_doc: &mut GerberDoc,
+    modal: ModalOperationMode,
+) -> Vec<Result<Command, ContentError>> {
+    // Sized for two: the combined form adds a second command, and these G-codes are the
+    // hot path in large flashed/region files.
+    let mut commands = Vec::with_capacity(2);
+    commands.push(Ok(
+        FunctionCode::GCode(GCode::InterpolationMode(mode)).into()
+    ));
+    // More than the trailing `*` means operation data follows on the same block.
+    if remaining_line.len() > 1 {
+        commands.push(parse_interpolate_move_or_flash(
+            remaining_line,
+            gerber_doc,
+            modal,
+        ));
+    }
+    commands
+}
+
 fn parse_line<T: Read>(
     line: &str,
     gerber_doc: &mut GerberDoc,
@@ -218,68 +342,59 @@ fn parse_line<T: Read>(
         // Safety: already explicitly checked that the line is not empty
         'G' => {
             match linechars.next().ok_or(ContentError::UnknownCommand {})? {
-                '0' => {
-                    let remaining_line = &line[3..];
-                    let using_deprecated_syntax = remaining_line.len() > 1;
-                    let mut commands = Vec::with_capacity(1);
-                    match linechars.next().ok_or(ContentError::UnknownCommand {})? {
-                        '1' => {
-                            // G01
-                            commands.push(Ok(FunctionCode::GCode(GCode::InterpolationMode(
-                                InterpolationMode::Linear,
-                            ))
-                            .into()));
-                            if using_deprecated_syntax {
-                                commands.push(parse_interpolate_move_or_flash(
-                                    remaining_line,
-                                    gerber_doc,
-                                    parser_context.modal_operation,
-                                ));
-                            }
-                        }
-                        '2' => {
-                            // G02
-                            commands.push(Ok(FunctionCode::GCode(GCode::InterpolationMode(
-                                InterpolationMode::ClockwiseCircular,
-                            ))
-                            .into()));
-                            if using_deprecated_syntax {
-                                commands.push(parse_interpolate_move_or_flash(
-                                    remaining_line,
-                                    gerber_doc,
-                                    parser_context.modal_operation,
-                                ));
-                            }
-                        }
-                        '3' => {
-                            // G03
-                            commands.push(Ok(FunctionCode::GCode(GCode::InterpolationMode(
-                                InterpolationMode::CounterclockwiseCircular,
-                            ))
-                            .into()));
-                            if using_deprecated_syntax {
-                                commands.push(parse_interpolate_move_or_flash(
-                                    remaining_line,
-                                    gerber_doc,
-                                    parser_context.modal_operation,
-                                ));
-                            }
-                        }
-                        '4' => {
-                            // G04
-                            commands.push(parse_comment(line, parser_context))
-                        }
-                        _ => commands.push(Err(ContentError::UnknownCommand {})),
-                    }
-                    Ok(commands)
-                }
-                '3' => Ok(vec![
-                    match linechars.next().ok_or(ContentError::UnknownCommand {})? {
-                        '6' => Ok(FunctionCode::GCode(GCode::RegionMode(true)).into()), // G36
-                        '7' => Ok(FunctionCode::GCode(GCode::RegionMode(false)).into()), // G37
-                        _ => Err(ContentError::UnknownCommand {}),
-                    },
-                ]),
+                '0' => match linechars.next().ok_or(ContentError::UnknownCommand {})? {
+                    '1' => Ok(interpolation_mode_commands(
+                        InterpolationMode::Linear,
+                        &line[3..],
+                        gerber_doc,
+                        parser_context.modal_operation,
+                    )),
+                    '2' => Ok(interpolation_mode_commands(
+                        InterpolationMode::ClockwiseCircular,
+                        &line[3..],
+                        gerber_doc,
+                        parser_context.modal_operation,
+                    )),
+                    '3' => Ok(interpolation_mode_commands(
+                        InterpolationMode::CounterclockwiseCircular,
+                        &line[3..],
+                        gerber_doc,
+                        parser_context.modal_operation,
+                    )),
+                    '4' => Ok(vec![parse_comment(line, parser_context)]),
+                    _ => Ok(vec![Err(ContentError::UnknownCommand {})]),
+                },
+                // Deprecated single-digit interpolation modes `G1`/`G2`/`G3` (gerber spec
+                // 8.3 style variations); ViewMate and others emit these instead of `G0n`.
+                '1' => Ok(interpolation_mode_commands(
+                    InterpolationMode::Linear,
+                    &line[2..],
+                    gerber_doc,
+                    parser_context.modal_operation,
+                )),
+                '2' => Ok(interpolation_mode_commands(
+                    InterpolationMode::ClockwiseCircular,
+                    &line[2..],
+                    gerber_doc,
+                    parser_context.modal_operation,
+                )),
+                // `G3` is ambiguous: the G36/G37 region commands, or deprecated single-digit
+                // `G3` (= G03). Peek the next char; `6`/`7` select a region, anything else is
+                // taken as G03 (matching how `G1`/`G01` tolerate trailing operation data).
+                '3' => match linechars.next() {
+                    Some('6') => Ok(vec![
+                        Ok(FunctionCode::GCode(GCode::RegionMode(true)).into()),
+                    ]),
+                    Some('7') => Ok(vec![Ok(
+                        FunctionCode::GCode(GCode::RegionMode(false)).into()
+                    )]),
+                    _ => Ok(interpolation_mode_commands(
+                        InterpolationMode::CounterclockwiseCircular,
+                        &line[2..],
+                        gerber_doc,
+                        parser_context.modal_operation,
+                    )),
+                },
                 '7' => Ok(vec![
                     match linechars.next().ok_or(ContentError::UnknownCommand {})? {
                         // the G74 command is technically part of the Deprecated commands
@@ -789,7 +904,8 @@ fn parse_comment<T: Read>(
         Some(regmatch) => {
             let string_content = regmatch
                 .name("string")
-                .map(|string| string.as_str().to_string());
+                .map(|string| decode_unicode_escapes(string.as_str()))
+                .transpose()?;
 
             let standard_content = regmatch
                 .name("standard")
@@ -862,7 +978,7 @@ fn parse_image_name(line: &str, gerber_doc: &GerberDoc) -> Result<String, Conten
                         capture_index: 1,
                     })?
                     .as_str();
-                Ok(String::from(image_name))
+                decode_unicode_escapes(image_name)
             }
             None => Err(ContentError::NoRegexMatch {
                 regex: RE_IMAGE_NAME.clone(),
@@ -884,8 +1000,8 @@ fn parse_aperture_macro_definition<T: Read>(
         let Some(line_result) = parser_context.next() else {
             break;
         };
-        let line = line_result?.trim().to_string();
-        macro_content.push_str(&line);
+        let (block, _) = line_result?;
+        macro_content.push_str(block.trim());
     }
 
     // Extract the macro name from the AM command
@@ -912,12 +1028,17 @@ fn parse_aperture_macro_definition<T: Read>(
     log::trace!("macro chunks: {:?}", chunks);
 
     for chunk in chunks {
+        // A block may span several physical lines; the tokenizer drops newlines but
+        // keeps the surrounding indentation, so trim each primitive before matching.
+        let chunk = chunk.trim();
         if let Some(stripped) = chunk.strip_prefix("0 ") {
             // Handle the special-case comment primitive
 
             // Gerber spec: 4.5.1.2 "The comment primitive starts with the ‘0’ code followed by a space and then a
             // single-line text string"
-            content.push(MacroContent::Comment(stripped.trim().to_string()));
+            content.push(MacroContent::Comment(decode_unicode_escapes(
+                stripped.trim(),
+            )?));
             continue;
         }
 
@@ -1815,7 +1936,8 @@ fn parse_file_attribute(line: Chars) -> Result<FileAttribute, ContentError> {
         };
     }
 
-    let attr_args = attr_args(line);
+    let decoded_args = attr_args(line)?;
+    let attr_args: Vec<&str> = decoded_args.iter().map(String::as_str).collect();
 
     log::trace!("TF args: {:?}, len: {}", attr_args, attr_args.len());
 
@@ -2118,7 +2240,8 @@ fn parse_aperture_attribute(
     }
 
     let raw_line = partial_line.as_str().to_string();
-    let attr_args = attr_args(partial_line);
+    let decoded_args = attr_args(partial_line)?;
+    let attr_args: Vec<&str> = decoded_args.iter().map(String::as_str).collect();
 
     log::trace!("TA ARGS: {:?}", attr_args);
 
@@ -2254,7 +2377,8 @@ fn parse_object_attribute(partial_line: Chars) -> Result<(String, ObjectAttribut
         }};
     }
 
-    let attr_args = attr_args(partial_line);
+    let decoded_args = attr_args(partial_line)?;
+    let attr_args: Vec<&str> = decoded_args.iter().map(String::as_str).collect();
 
     log::trace!("TO ARGS: {:?}", attr_args);
 
@@ -2471,12 +2595,45 @@ fn parse_macro_integer(value: &str) -> Result<MacroInteger, ContentError> {
     }
 }
 
-fn attr_args(partial_line: Chars<'_>) -> Vec<&str> {
-    partial_line
-        .as_str()
-        .split(',')
-        .map(|el| el.trim())
-        .collect()
+// Decode only after tokenizing commands and splitting fields. Decoded delimiters are
+// text, and a decoded backslash must never start a second round of decoding.
+fn decode_unicode_escapes(value: &str) -> Result<String, ContentError> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    let invalid = || ContentError::InvalidUnicodeEscape {
+        value: value.to_string(),
+    };
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        let digits = match chars.next() {
+            Some('u') => 4,
+            Some('U') => 8,
+            _ => return Err(invalid()),
+        };
+        let mut codepoint = 0u32;
+        for _ in 0..digits {
+            let digit = chars
+                .next()
+                .and_then(|ch| ch.to_digit(16))
+                .ok_or_else(invalid)?;
+            codepoint = (codepoint << 4) | digit;
+        }
+        decoded.push(char::from_u32(codepoint).ok_or_else(invalid)?);
+    }
+    Ok(decoded)
+}
+
+fn attr_args(partial_line: Chars<'_>) -> Result<Vec<String>, ContentError> {
+    let mut fields = partial_line.as_str().split(',');
+    // split always yields a first field; names use the ASCII name grammar.
+    let mut args = vec![fields.next().unwrap().trim().to_string()];
+    for field in fields {
+        args.push(decode_unicode_escapes(field.trim())?);
+    }
+    Ok(args)
 }
 
 fn trim_attr_line(mut partial_line: Chars) -> Result<Chars, ContentError> {
@@ -2495,9 +2652,34 @@ mod attr_args_tests {
     use super::*;
 
     #[test]
+    fn unicode_escapes_follow_spec_3_4_3() {
+        for (encoded, expected) in [
+            (r"\u00A9", "©"),
+            (r"\U000000a9", "©"),
+            (r"\u0025\u002A\u005C\u002C", "%*\\,"),
+            (r"\u0041B", "AB"),
+            (r"\U00000041B", "AB"),
+            (r"\U0010FFFF", "\u{10ffff}"),
+            (r"\u0000", "\0"),
+            (r"\u005Cu00A9", r"\u00A9"),
+            ("日本語", "日本語"),
+        ] {
+            assert_eq!(decode_unicode_escapes(encoded).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn attribute_names_are_not_string_fields() {
+        let args = attr_args(r"Custom,\u0041,\u002C".chars()).unwrap();
+        assert_eq!(args, ["Custom", "A", ","]);
+        let args = attr_args(r"\u0043ustom,\u0041".chars()).unwrap();
+        assert_eq!(args[0], r"\u0043ustom");
+    }
+
+    #[test]
     pub fn test_attr_args() {
         let attribute_chars = "  .DrillTolerance  , 0.02  , 0.01   ".chars();
-        let arguments = attr_args(attribute_chars);
+        let arguments = attr_args(attribute_chars).unwrap();
         println!("arguments: {:?}", arguments);
         assert_eq!(arguments, vec![".DrillTolerance", "0.02", "0.01"])
     }

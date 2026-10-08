@@ -1,0 +1,10 @@
+G04 escaped asterisk \u002A, percent \u0025 and backslash \u005C in a comment*
+%MOMM*%
+%FSLAX26Y26*%
+%TFMyEscapes,escaped comma \u002C in a field,escaped asterisk \u002A*%
+%ADD10C,0.01*%
+D10*
+X0Y0D02*
+G01*
+X5000000Y0D01*
+M02*

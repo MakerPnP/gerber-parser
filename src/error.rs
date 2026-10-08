@@ -14,6 +14,8 @@ pub enum ParseError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ContentError {
+    #[error("Invalid Unicode escape in string: {value:?}")]
+    InvalidUnicodeEscape { value: String },
     #[error("Document included a line that isn't valid.")]
     UnknownCommand {},
     #[error("Document included a line that isn't supported.")]
@@ -137,9 +139,11 @@ pub enum ContentError {
 }
 
 impl ContentError {
-    /// line number is 1-based, for humans.
-    pub fn to_with_context(self, line: Option<(usize, String)>) -> GerberParserErrorWithContext {
-        GerberParserErrorWithContext { error: self, line }
+    pub fn to_with_context(self, context: Option<ErrorContext>) -> GerberParserErrorWithContext {
+        GerberParserErrorWithContext {
+            error: self,
+            context,
+        }
     }
 }
 
@@ -150,18 +154,36 @@ impl PartialEq for ContentError {
     }
 }
 
+/// Where in the source a parse error occurred.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ErrorContext {
+    /// 1-based line number on which the failing token starts.
+    pub line: usize,
+    /// 1-based column offset of the failing token within that line.
+    pub offset: usize,
+    /// The token (command block) that failed to parse.
+    pub token: String,
+}
+
 #[derive(Error, Debug, PartialEq)]
 pub struct GerberParserErrorWithContext {
     pub error: ContentError,
-    /// line number is 1-based, for humans.
-    pub line: Option<(usize, String)>,
+    pub context: Option<ErrorContext>,
 }
 
 impl std::fmt::Display for GerberParserErrorWithContext {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self.line {
-            Some((number, content)) => {
-                write!(f, "Error: {}\nLine {}: '{}'", self.error, number, content)
+        match &self.context {
+            Some(ErrorContext {
+                line,
+                offset,
+                token,
+            }) => {
+                write!(
+                    f,
+                    "Error: {}\nLine {}:{}: '{}'",
+                    self.error, line, offset, token
+                )
             }
             _ => {
                 write!(f, "Error at unspecified line: {}", self.error)

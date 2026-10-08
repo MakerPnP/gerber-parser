@@ -47,6 +47,12 @@ The gerber specification 2024.05 is the latest version of the Gerber file format
 
 Contributions to improve support welcomed!
 
+### Unicode escapes
+
+String and attribute field values are decoded from Gerber `\uXXXX` and `\UXXXXXXXX`
+escapes into Unicode characters. Invalid escapes produce content errors with source context.
+Escaped delimiters are decoded after splitting commands and fields.
+
 ### Image Transformations
 
 Image transformations have been deprecated since December 2012 (I1 revision).

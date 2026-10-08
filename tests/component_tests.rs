@@ -1,4 +1,4 @@
-use gerber_parser::{parse, ContentError, GerberParserErrorWithContext};
+use gerber_parser::{parse, ContentError, ErrorContext, GerberParserErrorWithContext};
 use gerber_types::{
     Aperture, ApertureAttribute, ApertureBlock, ApertureDefinition, ApertureFunction,
     ApertureMacro, AxisSelect, Circle, CirclePrimitive, Command, CommentContent,
@@ -250,6 +250,52 @@ fn G04_comments() {
             Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
                 CommentContent::String("And now a comment after them".to_string(),)
             )))),
+        ]
+    );
+}
+
+#[test]
+fn unicode_escaped_reserved_characters_in_strings() {
+    // given
+    logging_init();
+
+    // Gerber spec 3.4.3: reserved characters in a string are written as a unicode escape,
+    // `\u002A` for `*` and `\u0025` for `%`, never as a raw byte (3.4.4 excludes them from the
+    // field grammar outright). A conforming string therefore cannot contain the block
+    // delimiters. The parser decodes escapes only after splitting commands and fields.
+    let reader = gerber_to_reader(
+        "
+    G04 escaped \\u002A asterisk and \\u0025 percent survive as comment text*
+    %TFMyEscapes,escaped comma \\u002C in a field*%
+    M02*
+    ",
+    );
+
+    // when
+    parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
+        cmd,
+        Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
+            _
+        )))) | Ok(Command::ExtendedCode(ExtendedCode::FileAttribute(
+            FileAttribute::UserDefined { .. }
+        )))
+    ));
+
+    // then
+    assert_eq!(
+        filtered_commands,
+        vec![
+            Ok(Command::FunctionCode(FunctionCode::GCode(GCode::Comment(
+                CommentContent::String(
+                    "escaped * asterisk and % percent survive as comment text".to_string()
+                )
+            )))),
+            Ok(Command::ExtendedCode(ExtendedCode::FileAttribute(
+                FileAttribute::UserDefined {
+                    name: "MyEscapes".to_string(),
+                    values: vec!["escaped comma , in a field".to_string()],
+                }
+            ))),
         ]
     );
 }
@@ -568,6 +614,152 @@ fn deprecated_modal_d01_invalid_without_preceding_d01() {
     assert_eq!(filtered_commands.len(), 3)
 }
 
+/// Commands are delimited by the end-of-block char `*`, not by newlines (gerber spec 4.1):
+/// a file may pack the whole stream onto a single physical line. Each `*` must still be
+/// parsed as its own command, including modal D01 coordinate-only blocks.
+#[test]
+fn commands_separated_by_block_terminator_on_one_line() {
+    // given
+    logging_init();
+
+    // Header, aperture, and a modal-D01 run all on one line, separated only by `*`.
+    let reader = gerber_to_reader(
+        "%FSLAX23Y23*%%MOMM*%%ADD10C, 0.01*%D10*X700Y1000D01*X1200Y1000*X1200Y1300*M02*",
+    );
+
+    let fs = CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 2, 3);
+
+    // when
+    parse_and_filter!(reader, commands, filtered_commands, |cmd| matches!(
+        cmd,
+        Ok(Command::FunctionCode(FunctionCode::DCode(
+            DCode::Operation(Operation::Interpolate(_, _))
+        )))
+    ));
+
+    // then
+    assert_eq_commands!(
+        filtered_commands,
+        vec![
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(700, 1000, fs).unwrap(),
+                    None,
+                ))
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(1200, 1000, fs).unwrap(),
+                    None,
+                ))
+            ))),
+            Ok(Command::FunctionCode(FunctionCode::DCode(
+                DCode::Operation(Operation::Interpolate(
+                    coordinates_from_gerber(1200, 1300, fs).unwrap(),
+                    None,
+                ))
+            ))),
+        ]
+    )
+}
+
+/// Error context reports the line, column offset, and failing token. With several commands
+/// packed onto one line, the offset is what pinpoints which one failed.
+#[test]
+fn error_context_reports_line_offset_and_token() {
+    // given
+    logging_init();
+
+    // `X100Y100*` at column 21 is invalid: no D01 in modal effect (gerber spec 8.3).
+    let reader = gerber_to_reader("%FSLAX23Y23*%%MOMM*%X100Y100*M02*");
+
+    // when
+    let doc = parse(reader).unwrap();
+
+    // then
+    assert!(matches!(
+        doc.errors().first().unwrap(),
+        GerberParserErrorWithContext {
+            error: ContentError::CoordinateDataWithoutOperationCode,
+            context: Some(ErrorContext { line, offset, token }),
+        } if *line == 1 && *offset == 21 && token.eq("X100Y100*")
+    ));
+}
+
+/// A truncated command makes `parse_line` bail before producing any command. That outer
+/// error must still be recorded with context, not silently dropped.
+#[test]
+fn outer_parse_error_is_recorded_with_context() {
+    // given
+    logging_init();
+
+    // A lone `G` is truncated: `parse_line` returns an outer Err before any command.
+    let reader = gerber_to_reader("%FSLAX23Y23*%\n%MOMM*%\nG\nM02*\n");
+
+    // when
+    let doc = parse(reader).unwrap();
+
+    // then
+    assert!(doc.errors().iter().any(|error| matches!(
+        error,
+        GerberParserErrorWithContext {
+            error: ContentError::UnknownCommand {},
+            context: Some(ErrorContext { line, token, .. }),
+        } if *line == 3 && token.eq("G")
+    )));
+}
+
+/// Deprecated single-digit G-codes `G1`/`G2`/`G3` (gerber spec 8.3 style variations) must
+/// parse like `G01`/`G02`/`G03`, including the combined `G1X..Y..D1*` form that arms modal
+/// D01. `G3` must still not shadow the `G36`/`G37` region commands. As emitted by ViewMate.
+#[test]
+fn deprecated_single_digit_g_codes() {
+    // given
+    logging_init();
+
+    // A region drawn with single-digit `G1` + combined D01, then modal-D01 coordinate lines.
+    let reader = gerber_to_reader(
+        "%FSLAX25Y25*%%MOIN*%%ADD111C,0.03937*%D111*X0Y0D2*G36*G1X200Y100D1*X200Y200*X100Y200*G37*M02*",
+    );
+
+    // when
+    let doc = parse(reader).unwrap();
+
+    // then
+    assert!(
+        doc.errors().is_empty(),
+        "unexpected errors: {:?}",
+        doc.errors()
+    );
+    let ok_commands: Vec<_> = doc
+        .commands
+        .iter()
+        .filter_map(|c| c.as_ref().ok())
+        .collect();
+    // G36 open and G37 close survived the `G3` disambiguation.
+    assert!(ok_commands.iter().any(|c| matches!(
+        c,
+        Command::FunctionCode(FunctionCode::GCode(GCode::RegionMode(true)))
+    )));
+    assert!(ok_commands.iter().any(|c| matches!(
+        c,
+        Command::FunctionCode(FunctionCode::GCode(GCode::RegionMode(false)))
+    )));
+    // The explicit `G1...D1` plus two modal-D01 lines = three interpolations.
+    let interpolations = ok_commands
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                Command::FunctionCode(FunctionCode::DCode(DCode::Operation(
+                    Operation::Interpolate(..)
+                )))
+            )
+        })
+        .count();
+    assert_eq!(interpolations, 3);
+}
+
 /// Test the D01* statements (circular)
 #[test]
 #[allow(non_snake_case)]
@@ -798,7 +990,7 @@ fn omitted_coordinate() {
     // Compare the two results nanos
     for (i, cmd) in filtered_commands.iter().enumerate() {
         let cmd2 = &filtered_commands2[i];
-        match { (cmd, cmd2) } {
+        match (cmd, cmd2) {
             (
                 Ok(Command::FunctionCode(FunctionCode::DCode(DCode::Operation(Operation::Flash(
                     Some(c1),
@@ -906,7 +1098,11 @@ fn test_load_scaling_zero() {
             error: ContentError::InvalidParameter {
                 parameter,
             },
-            line: Some((number, content)),
+            context: Some(ErrorContext {
+                line: number,
+                token: content,
+                ..
+            }),
         } if parameter.eq("0") && *number == 2 && content.eq("%LS0*%")
     ));
 }
@@ -2280,7 +2476,7 @@ fn missing_eof() {
     let reader = gerber_to_reader(
         "
     %FSLAX23Y23*%
-    %MOMM*%-
+    %MOMM*%
 
     G04 We should have a MO2 at the end, but what if we forget it?*      
     ",
@@ -2384,7 +2580,11 @@ fn coordinates_not_within_format() {
                 format,
                 cause: GerberError::CoordinateFormatError(_)
             },
-            line: Some((number, content)),
+            context: Some(ErrorContext {
+                line: number,
+                token: content,
+                ..
+            }),
         } if format.integer == 2 && format.decimal == 3 && *number == 8 && content.eq("X100000Y0D01*")
     ));
 }
@@ -3874,7 +4074,7 @@ fn malformed_aperture_definition() {
     let reader = gerber_to_reader(
         "
     %FSLAX23Y23*%
-    %MOMM*%-
+    %MOMM*%
 
 
     G04 Too many parameters *
@@ -3920,7 +4120,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("C") && content.eq("%ADD10C,1X2X3*%")
     ));
 
@@ -3932,7 +4132,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("C") && content.eq("%ADD10C*%")
     ));
 
@@ -3944,7 +4144,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("R") && content.eq("%ADD10R,1X2X3X4*%")
     ));
 
@@ -3956,7 +4156,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("R") && content.eq("%ADD10R,1*%")
     ));
 
@@ -3968,7 +4168,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("R") && content.eq("%ADD10R*%")
     ));
 
@@ -3980,7 +4180,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("O") && content.eq("%ADD10O,1X2X3X4*%")
     ));
 
@@ -3992,7 +4192,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("O") && content.eq("%ADD10O,1*%")
     ));
 
@@ -4004,7 +4204,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("O") && content.eq("%ADD10O*%")
     ));
 
@@ -4016,7 +4216,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("P") && content.eq("%ADD10P,1X2X3X4X5*%")
     ));
 
@@ -4028,7 +4228,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("P") && content.eq("%ADD10P,1*%")
     ));
 
@@ -4040,7 +4240,7 @@ fn malformed_aperture_definition() {
                 aperture_code,
                 aperture_name,
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if *aperture_code == 10 && aperture_name.eq("P") && content.eq("%ADD10P*%")
     ));
 
@@ -4051,7 +4251,7 @@ fn malformed_aperture_definition() {
             error: ContentError::UnknownApertureType {
                 type_str
             },
-            line: Some((_line_number, content)),
+            context: Some(ErrorContext { token: content, .. }),
         } if type_str.eq("T") && content.eq("%ADD10T*%")
     ));
 }
@@ -4094,4 +4294,115 @@ fn oversized_coordinate_formats_do_not_panic() {
         // then
         assert!(doc.commands.iter().any(Result::is_err), "{gerber}");
     }
+}
+
+#[test]
+fn unicode_escape_decoding_across_string_fields() {
+    let input = r"G04 café \u00a9 \U0001F680 \u005Cu002A*
+%TFCustom,\u0020hello\u0020,\u002C\u002A\u0025*%
+%TALabel,\u03A9*%
+%TO.C,R\u0031*%
+G04 #@! TFNote,\u65E5\u672C*
+%AMExample*0 \u00A9 \U0001F680*1,1,1,0,0*%
+M02*";
+    let doc = parse(gerber_to_reader(input)).unwrap();
+    let expected: Vec<Command> = vec![
+        GCode::Comment(CommentContent::String("café © 🚀 \\u002A".into())).into(),
+        ExtendedCode::FileAttribute(FileAttribute::UserDefined {
+            name: "Custom".into(),
+            values: vec![" hello ".into(), ",*%".into()],
+        })
+        .into(),
+        ExtendedCode::ApertureAttribute(ApertureAttribute::UserDefined {
+            name: "Label".into(),
+            values: vec!["Ω".into()],
+        })
+        .into(),
+        ExtendedCode::ObjectAttribute(ObjectAttribute::Component("R1".into())).into(),
+        GCode::Comment(CommentContent::Standard(StandardComment::FileAttribute(
+            FileAttribute::UserDefined {
+                name: "Note".into(),
+                values: vec!["日本".into()],
+            },
+        )))
+        .into(),
+        ExtendedCode::ApertureMacro(ApertureMacro {
+            name: "Example".into(),
+            content: vec![
+                MacroContent::Comment("© 🚀".into()),
+                MacroContent::Circle(CirclePrimitive {
+                    exposure: MacroBoolean::Value(true),
+                    diameter: MacroDecimal::Value(1.0),
+                    center: (MacroDecimal::Value(0.0), MacroDecimal::Value(0.0)),
+                    angle: None,
+                }),
+            ],
+        })
+        .into(),
+        MCode::EndOfFile.into(),
+    ];
+    let actual: Vec<_> = doc.commands.into_iter().map(Result::unwrap).collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn invalid_unicode_escapes_report_context_and_continue() {
+    for escape in [
+        r"\u123",
+        r"\u12g4",
+        r"\U00110000",
+        r"\uD800",
+        r"\U0000DFFF",
+        r"\UFFFFFFFF",
+        r"\q",
+        "\\",
+        "\\u日000",
+    ] {
+        for token in [
+            format!("G04 {}*", escape),
+            format!("%TFCustom,{}*%", escape),
+            format!("%TACustom,{}*%", escape),
+            format!("%TOCustom,{}*%", escape),
+            format!("G04 #@! TFCustom,{}*", escape),
+            format!("%IN{}*%", escape),
+            format!("%AMExample*0 {}*1,1,1,0,0*%", escape),
+        ] {
+            let input = format!("{}M02*", token);
+            let doc = parse(gerber_to_reader(&input)).unwrap();
+            let error = doc.commands[0].as_ref().unwrap_err();
+            assert!(matches!(
+                error.error,
+                ContentError::InvalidUnicodeEscape { .. }
+            ));
+            assert_eq!(error.context.as_ref().unwrap().token, token);
+            assert!(matches!(
+                doc.commands[1],
+                Ok(Command::FunctionCode(FunctionCode::MCode(MCode::EndOfFile)))
+            ));
+        }
+    }
+}
+
+#[test]
+fn image_name_and_escaped_comment_marker_are_decoded_as_text() {
+    let input = r"%INBoard\u002A\U00000025\u005C\u002C\u00A9*%
+G04 \u0023@! TFCustom,value*
+M02*";
+    let doc = parse(gerber_to_reader(input)).unwrap();
+    assert_eq!(doc.image_name.as_deref(), Some("Board*%\\,©"));
+    let expected: Vec<Command> = vec![
+        ExtendedCode::ImageName(gerber_types::ImageName {
+            name: "Board*%\\,©".into(),
+        })
+        .into(),
+        GCode::Comment(CommentContent::String("#@! TFCustom,value".into())).into(),
+        MCode::EndOfFile.into(),
+    ];
+    assert_eq!(
+        doc.commands
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
